@@ -42,12 +42,6 @@ npm start
    or use **Join board** and type the exact same name.
 4. The main area lists the board's images **by download date** (newest first).
 
-## GUI
-
-- Left sidebar: collapsed to icons (56 px, plain dark grey `#2b2b2b`);
-  expands to ~1/7 of the screen width on mouse hover.
-- Flat design: no rounded corners, no gradients, Helvetica Neue typography.
-
 ## Data location
 
 `data/boards/<hash>/` — board folders (images live here, safe to back up).
