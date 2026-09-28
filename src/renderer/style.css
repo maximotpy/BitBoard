@@ -1,0 +1,455 @@
+/* BitBoard — flat, sharp-cornered, no gradients. Helvetica Neue only. */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  border-radius: 0 !important;
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+:root {
+  --bg: #1e1e1e;
+  --sidebar: #2b2b2b;
+  --sidebar-hover: #3a3a3a;
+  --sidebar-active: #4a4a4a;
+  --text: #d6d6d6;
+  --text-dim: #8a8a8a;
+  --accent: #6e6e6e;
+  --row-alt: #242424;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+#app {
+  display: flex;
+  height: 100vh;
+}
+
+/* ---------------- Sidebar ---------------- */
+
+#sidebar {
+  width: 56px;                       /* collapsed: icons only */
+  min-width: 56px;
+  background: var(--sidebar);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: width 0.15s linear, min-width 0.15s linear;
+  border-right: 1px solid #111;
+}
+
+/* Expanded when hovered OR pinned by keyboard focus */
+#sidebar:hover,
+#sidebar:focus-within {
+  width: 14.28vw;                   /* ~1/7 of the screen */
+  min-width: 14.28vw;
+}
+
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 0 14px 0;
+  white-space: nowrap;
+}
+
+.brand-icon {
+  width: 56px;
+  text-align: center;
+  font-size: 20px;
+  color: var(--text);
+  flex: 0 0 56px;
+}
+
+.brand-label {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  opacity: 0;
+  transition: opacity 0.1s linear;
+}
+
+#sidebar:hover .brand-label,
+#sidebar:focus-within .brand-label { opacity: 1; }
+
+#board-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.board-item {
+  display: flex;
+  align-items: center;
+  height: 40px;
+  cursor: pointer;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+
+.board-item:hover { background: var(--sidebar-hover); }
+.board-item.active { background: var(--sidebar-active); color: var(--text); }
+
+.board-icon {
+  flex: 0 0 56px;
+  width: 56px;
+  text-align: center;
+  font-size: 16px;
+}
+
+.board-name {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  opacity: 0;
+  transition: opacity 0.1s linear;
+}
+
+#sidebar:hover .board-name,
+#sidebar:focus-within .board-name { opacity: 1; }
+
+#sidebar-actions {
+  border-top: 1px solid #111;
+  padding: 6px 0;
+}
+
+.side-btn {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: 38px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.side-btn:hover { background: var(--sidebar-hover); color: var(--text); }
+
+.btn-icon {
+  flex: 0 0 56px;
+  width: 56px;
+  text-align: center;
+  font-size: 16px;
+}
+
+.btn-label {
+  opacity: 0;
+  transition: opacity 0.1s linear;
+}
+
+#sidebar:hover .btn-label,
+#sidebar:focus-within .btn-label { opacity: 1; }
+
+#sidebar-footer {
+  border-top: 1px solid #111;
+  padding: 6px;
+  height: 110px;
+  overflow: hidden;
+}
+
+#log {
+  font-size: 10px;
+  color: var(--text-dim);
+  height: 100%;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  opacity: 0;
+  transition: opacity 0.1s linear;
+}
+
+#sidebar:hover #log,
+#sidebar:focus-within #log { opacity: 1; }
+
+/* ---------------- Content ---------------- */
+
+#content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+#content-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 20px;
+  border-bottom: 1px solid #111;
+  background: var(--bg);
+}
+
+#board-title {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+#board-meta {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.flat-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.flat-btn:hover { background: #7d7d7d; }
+.flat-btn:disabled { background: #3a3a3a; color: var(--text-dim); cursor: default; }
+
+/* ---------------- View tabs (Gallery / Details) ---------------- */
+
+#view-tabs {
+  display: flex;
+  gap: 2px;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  font-size: 13px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.tab-btn:hover { color: var(--text); }
+
+.tab-btn.active {
+  color: var(--text);
+  border-bottom-color: var(--text);
+}
+
+#image-gallery {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+  column-count: 5;
+  column-gap: 12px;
+}
+
+@media (max-width: 1400px) { #image-gallery { column-count: 4; } }
+@media (max-width: 1100px) { #image-gallery { column-count: 3; } }
+@media (max-width: 800px)  { #image-gallery { column-count: 2; } }
+
+.gallery-tile {
+  break-inside: avoid;
+  margin-bottom: 12px;
+  background: #111;
+  border: 1px solid #000;
+  cursor: pointer;
+}
+
+.gallery-tile:hover { border-color: var(--accent); }
+
+.gallery-img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.gallery-placeholder {
+  width: 100%;
+  height: 140px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 24px;
+}
+
+.gallery-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: var(--row-alt);
+}
+
+.gallery-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gallery-size { flex: 0 0 auto; }
+
+/* ---------------- Lightbox ---------------- */
+
+#lightbox {
+  position: fixed;
+  inset: 0;
+  background: #000000e0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  cursor: zoom-out;
+}
+
+#lightbox.hidden { display: none; }
+
+#lightbox-inner {
+  max-width: 92vw;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+#lightbox-img {
+  max-width: 92vw;
+  max-height: 86vh;
+  object-fit: contain;
+  background: #111;
+  border: 1px solid #000;
+}
+
+#lightbox-caption {
+  font-size: 12px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+#image-list {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.file-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 20px;
+  border-bottom: 1px solid #111;
+}
+
+.file-row:nth-child(even) { background: var(--row-alt); }
+
+.file-thumb {
+  width: 48px;
+  height: 48px;
+  object-fit: cover;
+  background: #111;
+  border: 1px solid #000;
+  flex: 0 0 48px;
+}
+
+.file-thumb-placeholder {
+  width: 48px;
+  height: 48px;
+  background: #111;
+  border: 1px solid #000;
+  flex: 0 0 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  font-size: 18px;
+}
+
+.file-info { flex: 1; min-width: 0; }
+
+.file-name {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-date {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+.file-size {
+  font-size: 12px;
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+.empty-state {
+  padding: 60px 20px;
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-thumb { background: #3a3a3a; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------------- Modal (flat, sharp corners) ---------------- */
+
+.hidden { display: none; }
+
+#modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: #000000b0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+/* Must outrank the ID rule above — class-only .hidden loses on specificity. */
+#modal-backdrop.hidden { display: none; }
+
+#modal {
+  width: 360px;
+  background: var(--sidebar);
+  border: 1px solid #111;
+  padding: 20px;
+}
+
+#modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+#modal-input {
+  width: 100%;
+  background: #1a1a1a;
+  border: 1px solid #111;
+  color: var(--text);
+  padding: 8px;
+  font-size: 13px;
+  outline: none;
+}
+
+#modal-input:focus { border-color: var(--accent); }
+
+#modal-error {
+  color: #e07070;
+  font-size: 11px;
+  min-height: 14px;
+  margin-top: 6px;
+}
+
+#modal-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
