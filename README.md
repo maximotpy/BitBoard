@@ -1,6 +1,6 @@
 # BitBoard
 
-P2P image replication between devices — a "cloud folder" without the cloud.
+P2P image replication between devices
 
 Every **board** is a named folder of images. Each device running BitBoard that
 joins a board both **seeds and downloads** it over the **BitTorrent protocol**

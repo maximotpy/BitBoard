@@ -1,0 +1,33 @@
+R_DEF: Internal format may change without notice
+local
+color ic_launcher_background
+drawable ic_launcher_foreground
+id boardMeta
+id boardName
+id boardProgress
+id boardTitle
+id boardsList
+id btnAddImage
+id btnJoinBoard
+id emptyHint
+id fabNewBoard
+id fullImage
+id fullImageOverlay
+id imageGrid
+id imageThumb
+id logLine
+id title
+layout activity_board
+layout activity_main
+layout item_board
+layout item_empty
+layout item_image
+layout item_join
+mipmap ic_launcher
+string add_image
+string app_name
+string board_empty_hint
+string empty_hint
+string join_board
+string new_board
+style Theme.BitBoard

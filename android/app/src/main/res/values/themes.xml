@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.BitBoard" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#4fc3f7</item>
+        <item name="colorPrimaryDark">#0288d1</item>
+        <item name="colorAccent">#4fc3f7</item>
+        <item name="android:windowBackground">#1e1e1e</item>
+    </style>
+</resources>

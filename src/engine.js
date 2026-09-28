@@ -81,6 +81,15 @@ function boardInfoHash(boardName) {
   return sha1('bitboard-board-v1:' + boardName.trim().toLowerCase());
 }
 
+/**
+ * Magnet URI for a board swarm. Includes tracker hints (`tr=`) so a joining
+ * peer can rendezvous via the trackers even when DHT is slow or blocked.
+ */
+function boardMagnet(boardName, infoHash) {
+  const tr = TRACKERS.map(t => '&tr=' + encodeURIComponent(t)).join('');
+  return `magnet:?xt=urn:btih:${infoHash}&dn=bitboard-${encodeURIComponent(boardName)}${tr}`;
+}
+
 class BitBoardEngine extends EventEmitter {
   constructor() {
     super();
@@ -92,12 +101,16 @@ class BitBoardEngine extends EventEmitter {
     this.beaconTimer = null;
     this._destroyed = false;
 
-    // Async bootstrap: load ESM deps, then create the torrent client.
+    // Async bootstrap: load ESM deps, create the torrent client, then
+    // restore the boards saved from the previous run.
     this._ready = (async () => {
       await loadEsmDeps();
-      this.client = new WebTorrent({ dht: true, maxConns: 200 });
+      // lsd: true so LAN peers find each other via Local Service Discovery
+      // even when trackers/DHT are unavailable (Android enables LSD too).
+      this.client = new WebTorrent({ dht: true, lsd: true, maxConns: 200 });
       this.client.on('error', (err) => this.emit('log', 'client error: ' + err.message));
       this.client.on('torrent', () => this._emitBoardsChanged());
+      await this._restoreBoards();
     })();
   }
 
@@ -124,6 +137,57 @@ class BitBoardEngine extends EventEmitter {
       };
     }
     try { fs.writeFileSync(STATE_FILE, JSON.stringify(out, null, 2)); } catch (_) {}
+  }
+
+  /**
+   * Re-open the boards saved in state.json from the previous run so they
+   * reappear in the UI after a restart. Boards whose folder still exists are
+   * re-seeded locally; the rest are re-joined from the swarm (or kept as
+   * "searching for peers" entries so the user doesn't lose them).
+   */
+  async _restoreBoards() {
+    const saved = (this.state && this.state.boards) || {};
+    const names = Object.keys(saved);
+    if (!names.length) return;
+    this.emit('log', `restoring ${names.length} saved board(s)…`);
+
+    for (const name of names) {
+      if (this.boards.has(name)) continue;
+      const dir = this.boardDir(name);
+      fs.mkdirSync(dir, { recursive: true });
+
+      const board = {
+        name,
+        dir,
+        infoHash: saved[name].infoHash || boardInfoHash(name),
+        torrent: null,
+        files: new Map(),
+        createdAt: saved[name].createdAt || Date.now()
+      };
+      this.boards.set(name, board);
+      this._scanFiles(board);
+      this._emitBoardsChanged();
+
+      try {
+        // If the folder has content (or even just needs a manifest), seed it.
+        // Otherwise fetch the torrent from the swarm like a fresh join.
+        const hasContent = fs.readdirSync(dir).length > 0;
+        if (hasContent) {
+          await this._publishBoard(board);
+          this.emit('log', `restored board "${name}" — seeding`);
+        } else {
+          // joinBoard() returns early for boards already in the map, so
+          // remove the placeholder and let it do the full swarm join.
+          this.boards.delete(name);
+          await this.joinBoard(name);
+        }
+      } catch (err) {
+        // Keep the board listed even if the swarm is unreachable right now;
+        // the user's data (state.json) is preserved for the next attempt.
+        this.emit('log', `could not fully restore "${name}": ${err.message}`);
+      }
+    }
+    this._saveState();
   }
 
   /* ---------------- board lifecycle ---------------- */
@@ -251,8 +315,13 @@ class BitBoardEngine extends EventEmitter {
    * Join a board by name. Computes the deterministic infohash, asks the
    * swarm for the manifest torrent, downloads everything into the local
    * folder, then keeps seeding.
+   *
+   * `knownInfoHash` (optional) is the REAL content-derived infohash learned
+   * from a LAN beacon; when present it is used instead of the deterministic
+   * hash, because the seeded torrent's infohash is derived from its contents
+   * and never equals the deterministic name-hash.
    */
-  async joinBoard(name) {
+  async joinBoard(name, knownInfoHash) {
     await this._ready;
     name = String(name || '').trim();
     if (!name) throw new Error('Board name required');
@@ -264,7 +333,7 @@ class BitBoardEngine extends EventEmitter {
     const board = {
       name,
       dir,
-      infoHash: boardInfoHash(name),
+      infoHash: knownInfoHash || boardInfoHash(name),
       torrent: null,
       files: new Map(),
       createdAt: Date.now()
@@ -272,7 +341,7 @@ class BitBoardEngine extends EventEmitter {
     this.boards.set(name, board);
 
     // Try to fetch the live torrent from the swarm by magnet.
-    const magnet = `magnet:?xt=urn:btih:${board.infoHash}&dn=bitboard-${encodeURIComponent(name)}`;
+    const magnet = boardMagnet(name, board.infoHash);
     await new Promise((resolve) => {
       this.client.add(magnet, { path: dir }, (torrent) => {
         board.torrent = torrent;
@@ -347,10 +416,15 @@ class BitBoardEngine extends EventEmitter {
         if (msg.peerId === this.peerId()) return; // our own beacon
         // A peer announced boards it has. If we don't know one of them,
         // join it automatically — that is the "cloud-like" replication.
+        // The beacon carries the peer's REAL content-derived infohash, which
+        // is the only reliable way to find the swarm (the deterministic
+        // name-hash never matches a seeded torrent's infohash).
         for (const b of (msg.boards || [])) {
           if (!this.boards.has(b.name)) {
             this.emit('log', `discovered board "${b.name}" on LAN (${rinfo.address}) — joining`);
-            this.joinBoard(b.name).catch(() => {});
+            this.joinBoard(b.name, b.infoHash).catch(() => {});
+          } else {
+            this._followInfoHashUpdate(b.name, b.infoHash);
           }
         }
       } catch (_) {}
@@ -386,6 +460,44 @@ class BitBoardEngine extends EventEmitter {
       boards: [...this.boards.keys()].map(n => ({ name: n, infoHash: this.boards.get(n).infoHash }))
     }));
     try { this.socket.send(msg, 0, msg.length, MULTICAST_PORT, MULTICAST_ADDR); } catch (_) {}
+  }
+
+  /**
+   * A LAN peer announced a board we already have, but with a DIFFERENT
+   * infohash — meaning the board was re-published (files added/removed) and
+   * the swarm moved. Leave our stale swarm and join the new one so the two
+   * devices converge again instead of seeding disjoint swarms forever.
+   */
+  async _followInfoHashUpdate(name, newInfoHash) {
+    if (!newInfoHash || this._destroyed) return;
+    const board = this.boards.get(name);
+    if (!board || board.infoHash === newInfoHash) return;
+    if (board._migrating) return; // already switching swarms
+    board._migrating = true;
+    this.emit('log', `board "${name}" updated on a peer — switching to the new swarm`);
+    try {
+      if (board.torrent) {
+        const old = board.torrent;
+        board.torrent = null;
+        await new Promise((res) => { try { old.destroy(() => res()); } catch (_) { res(); } });
+      }
+      board.infoHash = newInfoHash;
+      this._saveState();
+      this._emitBoardsChanged();
+      this.client.add(boardMagnet(name, newInfoHash), { path: board.dir }, (torrent) => {
+        board.torrent = torrent;
+        this._scanFiles(board);
+        torrent.on('done', () => {
+          this.emit('log', `board "${name}" fully synced`);
+          this._scanFiles(board);
+          this._emitBoardsChanged();
+        });
+        torrent.on('wire', () => this.emit('log', `peer connected to "${name}" swarm`));
+        this._emitBoardsChanged();
+      });
+    } finally {
+      board._migrating = false;
+    }
   }
 
   /* ---------------- reporting to the UI ---------------- */

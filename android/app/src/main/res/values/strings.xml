@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BitBoard</string>
+    <string name="new_board">New board</string>
+    <string name="add_image">Add image</string>
+    <string name="join_board">Join board…</string>
+    <string name="empty_hint">No boards yet.\n\nTap + to create one (e.g. Vacation), or Join board to sync with another device on the same network.</string>
+    <string name="board_empty_hint">No images yet.\n\nUse "Add image" to publish one to the swarm.</string>
+</resources>
