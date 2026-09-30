@@ -9,8 +9,7 @@ P2P image replication between devices
 
 Every **board** is a named folder of images. Each device running BitBoard that
 joins a board both **seeds and downloads** it over the **BitTorrent protocol**,
-so images replicate automatically to every device that has the same board —
-like a cloud folder, but fully peer-to-peer.
+so images replicate automatically to every device that has the same board
 
 ## How it works
 
