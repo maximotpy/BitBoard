@@ -1,0 +1,1018 @@
+From c4d49036d9ad9f322be448488482e2f160ff5646 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 30 Sep 2026 01:36:47 +0000
+Subject: [PATCH] Fix sync across different networks: relay-based infohash
+ rendezvous
+
+Each device seeds its own torrent with a unique infohash, and infohashes were
+only exchanged via the LAN UDP beacon, so trackers/DHT could never connect
+devices on different networks. Add a pub/sub rendezvous (ntfy protocol) that
+carries 'board X = infohash H' between devices, on desktop and Android, plus
+tracker list additions, merge back-off, docs and an end-to-end test.
+---
+ README.md                                     |  12 +-
+ android/README.md                             |  13 +-
+ .../com/bitboard/app/engine/BitBoardEngine.kt | 138 ++++++++++++++-
+ .../java/com/bitboard/app/engine/Protocol.kt  |  27 ++-
+ .../com/bitboard/app/engine/SignalChannel.kt  | 123 +++++++++++++
+ package.json                                  |   3 +-
+ src/engine.js                                 | 143 +++++++++++++++-
+ src/signal.js                                 | 162 ++++++++++++++++++
+ test/signal-test.js                           |  93 ++++++++++
+ 9 files changed, 699 insertions(+), 15 deletions(-)
+ create mode 100644 android/app/src/main/java/com/bitboard/app/engine/SignalChannel.kt
+ create mode 100644 src/signal.js
+ create mode 100644 test/signal-test.js
+
+diff --git a/README.md b/README.md
+index 9aa1d2a..1c1323e 100644
+--- a/README.md
++++ b/README.md
+@@ -23,8 +23,16 @@ Device A                 Device B
+   torrent and peers pick up the new file automatically.
+ - **LAN discovery**: a UDP multicast beacon (`239.255.66.66:45666`) announces
+   which boards each device has; devices auto-join boards they are missing.
+-- **Cross-network**: peers also find each other through public WebTorrent
+-  trackers and the DHT, so sync works over the internet too.
++- **Cross-network**: devices on *different* networks find each other through an
++  **internet rendezvous** (`src/signal.js`). Each device seeds its own torrent
++  and its infohash differs from every other device's, so trackers/DHT alone can
++  never match two devices. Devices therefore publish "board X = infohash H" to a
++  tiny pub/sub relay (ntfy protocol, `https://ntfy.sh` by default; one topic per
++  board, derived from a hash of the board name). A peer that learns H fetches it
++  through the normal trackers/DHT/PEX and merges the images it lacks. Only
++  infohashes go through the relay: never images, IPs or file names.
++  Set `BITBOARD_SIGNAL_URL` to use your own ntfy server, or `BITBOARD_SIGNAL=off`
++  to disable it (LAN-only).
+ 
+ ## Run
+ 
+diff --git a/android/README.md b/android/README.md
+index 3c0a3dd..7da3f76 100644
+--- a/android/README.md
++++ b/android/README.md
+@@ -23,6 +23,11 @@ The wire protocol is identical on both platforms:
+   on multicast `239.255.66.66:45666` **and** the subnet broadcast address,
+   every 3 s, on every network interface. `port` is the sender's BitTorrent TCP
+   port; receivers connect to it directly. New peers get a unicast `reply` beacon.
++- **Internet rendezvous**: infohashes are also exchanged through a pub/sub relay
++  (`SignalChannel.kt`, ntfy protocol, https://ntfy.sh) on topic
++  `bitboard-` + first 32 hex of `sha256("bitboard-signal-v1:" + lowercased name)`,
++  message `{app:"bitboard", v:1, peerId, board, infoHash, ts}`. Identical on
++  desktop (`src/signal.js`). This is what makes sync work across networks.
+ - **Sync = merge, not swarm switching.** Two devices never share an infohash
+   for the same board (it covers mtimes, creation date, creator string).
+   Each device seeds its own folder; on a beacon with an unseen hash it fetches
+@@ -72,5 +77,9 @@ backgrounded.
+ ## Notes
+ 
+ - WebTorrent's WebRTC trackers are not used on Android (libtorrent speaks
+-  BitTorrent over TCP/UDP); sync works via DHT, UDP trackers, LSD and the LAN
+-  beacon — which covers LAN and most internet scenarios.
++  BitTorrent over TCP/UDP). Across networks, sync needs the relay above (to learn
++  the peer's infohash) plus DHT / UDP trackers / UPnP to actually connect.
++- Two phones that are BOTH on mobile data behind carrier-grade NAT usually cannot
++  open a connection to each other at all; this is a limit of direct P2P, not a
++  bug. At least one side on home Wi-Fi with UPnP/NAT-PMP (or a forwarded TCP
++  port 6881) is normally enough.
+diff --git a/android/app/src/main/java/com/bitboard/app/engine/BitBoardEngine.kt b/android/app/src/main/java/com/bitboard/app/engine/BitBoardEngine.kt
+index dbaae16..b9d5677 100644
+--- a/android/app/src/main/java/com/bitboard/app/engine/BitBoardEngine.kt
++++ b/android/app/src/main/java/com/bitboard/app/engine/BitBoardEngine.kt
+@@ -3,6 +3,7 @@ package com.bitboard.app.engine
+ import android.content.Context
+ import android.os.Build
+ import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Job
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.asCoroutineDispatcher
+@@ -89,6 +90,13 @@ class BitBoardEngine(val context: Context) {
+     /** name -> last beacon time for boards seen on the LAN but NOT joined. */
+     private val discoveredMap = ConcurrentHashMap<String, Long>()
+ 
++    /** Internet rendezvous: exchanges infohashes with devices on OTHER networks. */
++    private val signal = SignalChannel(log = { log(it) })
++    private var signalLoops: Job? = null
++
++    /** Latest infohash announced by an internet peer. */
++    private class SignalPeer(val hash: String, val at: Long)
++
+     private lateinit var dataDir: File
+     private lateinit var boardsDir: File
+     private lateinit var torrentsDir: File
+@@ -145,6 +153,12 @@ class BitBoardEngine(val context: Context) {
+         val merging: MutableSet<String> = ConcurrentHashMap.newKeySet()   // peer hashes in flight
+         val retryAt = ConcurrentHashMap<String, Long>()
+         val lanPeers = ConcurrentHashMap<String, Long>()                  // peerId -> last beacon
++        val signalPeers = ConcurrentHashMap<String, SignalPeer>()         // relay peerId -> announcement
++        val signalInbox = ConcurrentHashMap<String, JSONObject>()         // relay peerId -> newest raw msg
++        val failCount = ConcurrentHashMap<String, Int>()                  // peer hash -> failed merges
++        @Volatile var sub: SignalChannel.Subscription? = null
++        @Volatile var announceJob: Job? = null
++        @Volatile var flushJob: Job? = null
+         val publishLock = Mutex()
+         @Volatile var mergeProgress = 1f
+     }
+@@ -177,7 +191,10 @@ class BitBoardEngine(val context: Context) {
+             // Start discovery BEFORE restoring boards: restoring re-seeds every
+             // board (slow), and beacons must not wait for that.
+             discovery = LanDiscovery(this@BitBoardEngine).also { it.start() }
++            startSignalLoops()
+             restoreBoards()
++            // Idempotent: also covers a stop()/start() cycle within one process.
++            boardMap.values.forEach { startSignal(it) }
+         }
+     }
+ 
+@@ -205,6 +222,9 @@ class BitBoardEngine(val context: Context) {
+         started = false
+         try { discovery?.stop() } catch (_: Exception) {}
+         discovery = null
++        signalLoops?.cancel()
++        signalLoops = null
++        boardMap.values.forEach { stopSignal(it) }
+         try { session.stop() } catch (_: Exception) {}
+     }
+ 
+@@ -316,11 +336,13 @@ class BitBoardEngine(val context: Context) {
+         }
+         if (!created) return board
+ 
++        startSignal(board)
+         scanFiles(board)
+         publishBoards() // show in UI right away
+         try {
+             publishLocked(board)
+         } catch (e: Exception) {
++            stopSignal(board)
+             boardMap.remove(n)
+             publishBoards()
+             log("failed to $verb board \"$n\": ${e.message}")
+@@ -432,6 +454,7 @@ class BitBoardEngine(val context: Context) {
+         scanFiles(board)
+         if (board.handle != null) {
+             log("published \"${board.name}\" (${newHash.take(12)}…)")
++            scheduleAnnounce(board) // tell internet peers our new infohash
+         } else {
+             log("\"${board.name}\" was added but is not seeding yet")
+         }
+@@ -510,6 +533,17 @@ class BitBoardEngine(val context: Context) {
+             connectDirect(board, addr, port)
+             return
+         }
++        tryMerge(board, hash, addr, port)
++    }
++
++    /**
++     * Merge a peer's torrent [hash] into [board] unless we already did, are
++     * doing it, or failed recently. [addr]/[port] are optional: LAN beacons
++     * know where the peer is; internet announcements don't ("" / 0) and rely
++     * on trackers / DHT to connect.
++     */
++    private fun tryMerge(board: Board, hash: String, addr: String, port: Int) {
++        if (hash.equals(board.infoHash, true)) return
+         if (board.seen.contains(hash)) return
+         if ((board.retryAt[hash] ?: 0L) > System.currentTimeMillis()) return
+         if (!board.merging.add(hash)) return // already being fetched
+@@ -517,9 +551,14 @@ class BitBoardEngine(val context: Context) {
+         scope.launch {
+             try {
+                 mergeFromPeer(board, hash, addr, port)
++                board.failCount.remove(hash)
+             } catch (e: Exception) {
+-                board.retryAt[hash] = System.currentTimeMillis() + Protocol.RETRY_COOLDOWN_MS
+-                log("sync of \"${board.name}\" from $addr failed: ${e.message}")
++                // Exponential back-off so an offline peer isn't hammered.
++                val n = (board.failCount[hash] ?: 0) + 1
++                board.failCount[hash] = n
++                val wait = minOf(Protocol.RETRY_COOLDOWN_MS * (1L shl (n - 1).coerceAtMost(10)), Protocol.MAX_RETRY_COOLDOWN_MS)
++                board.retryAt[hash] = System.currentTimeMillis() + wait
++                log("sync of \"${board.name}\" from ${addr.ifEmpty { "internet peer" }} failed: ${e.message}")
+             } finally {
+                 board.merging.remove(hash)
+                 board.mergeProgress = 1f
+@@ -528,6 +567,99 @@ class BitBoardEngine(val context: Context) {
+         }
+     }
+ 
++    /* ------------------------------------------------------------------ */
++    /* internet rendezvous (relay)                                         */
++    /* ------------------------------------------------------------------ */
++
++    private fun startSignal(board: Board) {
++        if (board.sub != null) return
++        board.sub = signal.subscribe(Protocol.signalTopic(board.name)) { msg -> onSignal(board, msg) }
++    }
++
++    private fun stopSignal(board: Board) {
++        board.sub?.close()
++        board.sub = null
++        board.announceJob?.cancel()
++        board.flushJob?.cancel()
++    }
++
++    /** Heartbeat announcements + retry of unfinished merges. */
++    private fun startSignalLoops() {
++        signalLoops?.cancel()
++        signalLoops = scope.launch {
++            launch {
++                while (true) {
++                    delay(Protocol.SIGNAL_HEARTBEAT_MS)
++                    boardMap.values.forEach { announceNow(it) }
++                }
++            }
++            launch {
++                while (true) {
++                    delay(Protocol.SIGNAL_TICK_MS)
++                    signalTick()
++                }
++            }
++        }
++    }
++
++    private fun scheduleAnnounce(board: Board) {
++        if (!started) return
++        board.announceJob?.cancel()
++        board.announceJob = scope.launch {
++            delay(Protocol.SIGNAL_ANNOUNCE_DEBOUNCE_MS)
++            announceNow(board)
++        }
++    }
++
++    private fun announceNow(board: Board) {
++        if (board.handle == null) return
++        val payload = JSONObject()
++            .put("app", "bitboard")
++            .put("v", 1)
++            .put("peerId", peerId)
++            .put("board", board.name)
++            .put("infoHash", board.infoHash)
++            .put("ts", System.currentTimeMillis())
++        scope.launch {
++            try {
++                signal.publish(Protocol.signalTopic(board.name), payload)
++            } catch (e: Exception) {
++                log("could not announce \"${board.name}\": ${e.message}")
++            }
++        }
++    }
++
++    /** A relay message for [board] (runs on the signal thread). Batched so a backlog collapses to the newest per peer. */
++    private fun onSignal(board: Board, msg: JSONObject) {
++        if (msg.optString("app") != "bitboard") return
++        val from = msg.optString("peerId")
++        if (from.isEmpty() || from == peerId) return // ours, or malformed
++        if (!Protocol.isInfoHash(msg.optString("infoHash"))) return
++        val prev = board.signalInbox[from]
++        if (prev == null || msg.optLong("ts", 0L) >= prev.optLong("ts", 0L)) board.signalInbox[from] = msg
++        if (board.flushJob?.isActive == true) return
++        board.flushJob = scope.launch {
++            delay(Protocol.SIGNAL_BATCH_MS)
++            for (id in board.signalInbox.keys.toList()) {
++                val m = board.signalInbox.remove(id) ?: continue
++                val hash = m.optString("infoHash").lowercase()
++                board.signalPeers[id] = SignalPeer(hash, System.currentTimeMillis())
++                tryMerge(board, hash, "", 0)
++            }
++        }
++    }
++
++    /** Retry merges from internet peers that announced recently but haven't synced yet. */
++    private fun signalTick() {
++        val now = System.currentTimeMillis()
++        for (b in boardMap.values) {
++            for ((id, p) in b.signalPeers.entries.toList()) {
++                if (now - p.at > Protocol.SIGNAL_TTL_MS) { b.signalPeers.remove(id); continue }
++                tryMerge(b, p.hash, "", 0)
++            }
++        }
++    }
++
+     /** Connect our seeding torrent straight to a LAN peer (no tracker/DHT). */
+     private fun connectDirect(board: Board, addr: String, port: Int) {
+         if (port <= 0) return
+@@ -546,7 +678,7 @@ class BitBoardEngine(val context: Context) {
+                 stageRoot.mkdirs()
+                 board.mergeProgress = 0f
+                 publishBoards()
+-                log("syncing \"${board.name}\" from $addr…")
++                log("syncing \"${board.name}\" from ${addr.ifEmpty { "internet peers (tracker/DHT)" }}…")
+ 
+                 onLt { session.download(Protocol.magnetUri(board.name, hash), stageRoot, torrent_flags_t()) }
+ 
+diff --git a/android/app/src/main/java/com/bitboard/app/engine/Protocol.kt b/android/app/src/main/java/com/bitboard/app/engine/Protocol.kt
+index 1ce606f..fd749b4 100644
+--- a/android/app/src/main/java/com/bitboard/app/engine/Protocol.kt
++++ b/android/app/src/main/java/com/bitboard/app/engine/Protocol.kt
+@@ -37,13 +37,27 @@ object Protocol {
+     const val LAN_PEER_TTL_MS = 10_000L       // a LAN peer counts as present for this long
+     const val DISCOVERED_TTL_MS = 30_000L     // a discovered (not joined) board stays offered this long
+ 
++    // Internet rendezvous (see SignalChannel.kt / src/signal.js)
++    const val SIGNAL_URL = "https://ntfy.sh"
++    const val SIGNAL_HEARTBEAT_MS = 10 * 60 * 1000L   // re-announce our infohash this often
++    const val SIGNAL_TTL_MS = 35 * 60 * 1000L         // a peer's announcement stays actionable this long
++    const val SIGNAL_TICK_MS = 30 * 1000L             // retry unfinished merges this often
++    const val SIGNAL_BATCH_MS = 1500L                 // collapse the relay backlog to the newest per peer
++    const val SIGNAL_ANNOUNCE_DEBOUNCE_MS = 2000L     // coalesce bursts of re-publishes
++    const val MAX_RETRY_COOLDOWN_MS = 10 * 60 * 1000L // back-off ceiling for a peer that keeps failing
++
+     private val HEX40 = Regex("^[0-9a-fA-F]{40}$")
+     fun isInfoHash(s: String): Boolean = HEX40.matches(s)
+ 
+     val TRACKERS = listOf(
+         "udp://tracker.opentrackr.org:1337/announce",
+         "udp://open.tracker.cl:1337/announce",
+-        "http://tracker.opentrackr.org:1337/announce"
++        "http://tracker.opentrackr.org:1337/announce",
++        // Extra public UDP trackers (same list as the desktop app).
++        "udp://open.stealth.si:80/announce",
++        "udp://exodus.desync.com:6969/announce",
++        "udp://tracker.torrent.eu.org:451/announce",
++        "udp://explodie.org:6969/announce"
+     )
+ 
+     val IMAGE_EXT = setOf(
+@@ -64,6 +78,17 @@ object Protocol {
+     fun boardInfoHash(boardName: String): String =
+         sha1Hex(HASH_PREFIX + boardName.trim().lowercase())
+ 
++    /**
++     * Relay topic for a board: "bitboard-" + first 32 hex chars of
++     * sha256("bitboard-signal-v1:" + lowercased name). MUST match signalTopic()
++     * in src/signal.js.
++     */
++    fun signalTopic(boardName: String): String {
++        val d = MessageDigest.getInstance("SHA-256")
++            .digest(("bitboard-signal-v1:" + boardName.trim().lowercase()).toByteArray(Charsets.UTF_8))
++        return "bitboard-" + d.joinToString("") { "%02x".format(it) }.take(32)
++    }
++
+     /** Board folder name: first 16 hex chars of sha1(lowercased name). */
+     fun boardDirName(boardName: String): String =
+         sha1Hex(boardName.trim().lowercase()).take(16)
+diff --git a/android/app/src/main/java/com/bitboard/app/engine/SignalChannel.kt b/android/app/src/main/java/com/bitboard/app/engine/SignalChannel.kt
+new file mode 100644
+index 0000000..daf8419
+--- /dev/null
++++ b/android/app/src/main/java/com/bitboard/app/engine/SignalChannel.kt
+@@ -0,0 +1,123 @@
++package com.bitboard.app.engine
++
++import org.json.JSONObject
++import java.io.BufferedReader
++import java.io.IOException
++import java.io.InputStreamReader
++import java.net.HttpURLConnection
++import java.net.URL
++import java.net.URLEncoder
++
++/**
++ * Internet rendezvous for BitBoard (mirror of src/signal.js).
++ *
++ * Every device seeds its OWN torrent per board and its infohash differs on
++ * every device, so trackers / DHT can never match two devices on different
++ * networks. Infohashes used to travel only in the LAN beacon, which is why
++ * sync worked on one Wi-Fi and never across the internet.
++ *
++ * This channel lets devices tell each other "for board X my current torrent is
++ * <infohash>" through a tiny pub/sub relay (ntfy protocol, https://ntfy.sh by
++ * default). One topic per board, derived from a hash of the board name. Only
++ * infohashes are sent — never images, IPs or file names. Once a peer's infohash
++ * is known, libtorrent finds the peer through trackers / DHT / PEX as usual.
++ */
++class SignalChannel(
++    private val baseUrl: String = Protocol.SIGNAL_URL,
++    private val log: (String) -> Unit = {}
++) {
++    private val base = baseUrl.trimEnd('/')
++
++    class Subscription internal constructor() {
++        @Volatile internal var closed = false
++        @Volatile internal var conn: HttpURLConnection? = null
++        @Volatile internal var thread: Thread? = null
++
++        fun close() {
++            closed = true
++            try { conn?.disconnect() } catch (_: Exception) {}
++            try { thread?.interrupt() } catch (_: Exception) {}
++        }
++    }
++
++    /** Publish one JSON message to [topic]. BLOCKING: call from a background thread. */
++    @Throws(IOException::class)
++    fun publish(topic: String, payload: JSONObject) {
++        val conn = URL("$base/$topic").openConnection() as HttpURLConnection
++        try {
++            conn.requestMethod = "POST"
++            conn.connectTimeout = 15_000
++            conn.readTimeout = 15_000
++            conn.doOutput = true
++            conn.setRequestProperty("Content-Type", "text/plain; charset=utf-8")
++            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
++            val code = conn.responseCode
++            if (code !in 200..299) throw IOException("signal relay answered HTTP $code")
++            try { conn.inputStream.use { it.readBytes() } } catch (_: Exception) {}
++        } finally {
++            conn.disconnect()
++        }
++    }
++
++    /**
++     * Subscribe to [topic] on a daemon thread. Reconnects forever with
++     * back-off. [onMessage] receives each parsed message (the JSON we
++     * published) on that thread.
++     */
++    fun subscribe(topic: String, onMessage: (JSONObject) -> Unit): Subscription {
++        val sub = Subscription()
++        val t = Thread({
++            var backoff = 2_000L
++            var lastId: String? = null
++            while (!sub.closed) {
++                var conn: HttpURLConnection? = null
++                try {
++                    val since = lastId ?: "30m"
++                    val url = URL("$base/$topic/json?since=" + URLEncoder.encode(since, "UTF-8"))
++                    conn = (url.openConnection() as HttpURLConnection).apply {
++                        connectTimeout = 15_000
++                        // The relay sends a keepalive every ~45 s: two minutes of
++                        // silence means a dead connection (phone changed network).
++                        readTimeout = 120_000
++                    }
++                    sub.conn = conn
++                    val code = conn.responseCode
++                    if (code != 200) {
++                        if (code == 400) lastId = null // unknown / expired id
++                        throw IOException("signal relay answered HTTP $code")
++                    }
++                    backoff = 2_000L
++                    BufferedReader(InputStreamReader(conn.inputStream, Charsets.UTF_8)).use { r ->
++                        while (!sub.closed) {
++                            val line = r.readLine() ?: break
++                            if (line.isBlank()) continue
++                            try {
++                                val ev = JSONObject(line)
++                                if (ev.optString("event") != "message") continue
++                                ev.optString("id").takeIf { it.isNotEmpty() }?.let { lastId = it }
++                                onMessage(JSONObject(ev.optString("message")))
++                            } catch (_: Exception) {
++                                // malformed line / message, or a handler error: keep the stream alive
++                            }
++                        }
++                    }
++                } catch (e: Exception) {
++                    if (sub.closed) break
++                    log("signal relay: ${e.message} — retrying")
++                } finally {
++                    try { conn?.disconnect() } catch (_: Exception) {}
++                }
++                if (sub.closed) break
++                val until = System.currentTimeMillis() + backoff
++                while (!sub.closed && System.currentTimeMillis() < until) {
++                    try { Thread.sleep(250) } catch (_: InterruptedException) { break }
++                }
++                backoff = minOf(backoff * 2, 60_000L)
++            }
++        }, "bitboard-signal")
++        t.isDaemon = true
++        sub.thread = t
++        t.start()
++        return sub
++    }
++}
+diff --git a/package.json b/package.json
+index 9e8ffff..1677916 100644
+--- a/package.json
++++ b/package.json
+@@ -7,7 +7,8 @@
+   "license": "MIT",
+   "scripts": {
+     "start": "electron .",
+-    "dev": "electron . --dev"
++    "dev": "electron . --dev",
++    "test:signal": "node test/signal-test.js"
+   },
+   "devDependencies": {
+     "electron": "^31.7.7"
+diff --git a/src/engine.js b/src/engine.js
+index 869773a..a458fda 100644
+--- a/src/engine.js
++++ b/src/engine.js
+@@ -29,6 +29,7 @@ async function loadEsmDeps() {
+   createTorrent = (await import('create-torrent')).default;
+ }
+ const dgram = require('dgram');
++const { SignalChannel, signalTopic } = require('./signal');
+ 
+ // BITBOARD_DATA_DIR (or the `dataDir` constructor option) lets tests and
+ // multiple instances on one machine use separate data folders.
+@@ -48,7 +49,13 @@ const TRACKERS = [
+   'wss://tracker.openwebtorrent.com',
+   'wss://tracker.webtorrent.dev',
+   'udp://tracker.opentrackr.org:1337/announce',
+-  'udp://open.tracker.cl:1337/announce'
++  'udp://open.tracker.cl:1337/announce',
++  // Extra public UDP trackers: more chances that two peers on different
++  // networks announce to (and hear about each other from) the same tracker.
++  'udp://open.stealth.si:80/announce',
++  'udp://exodus.desync.com:6969/announce',
++  'udp://tracker.torrent.eu.org:451/announce',
++  'udp://explodie.org:6969/announce'
+ ];
+ const PUBLISH_TIMEOUT_MS = 30000;
+ const METADATA_TIMEOUT_MS = 45000;   // give up fetching a peer's torrent metadata
+@@ -57,6 +64,14 @@ const RETRY_COOLDOWN_MS = 20000;     // don't hammer a peer whose fetch just fai
+ const LAN_PEER_TTL_MS = 10000;       // a LAN peer counts as present for this long
+ const DISCOVERED_TTL_MS = 30000;     // a discovered (not joined) board stays offered this long
+ 
++// Internet rendezvous (see signal.js)
++const SIGNAL_HEARTBEAT_MS = 10 * 60 * 1000;  // re-announce our infohash this often
++const SIGNAL_TTL_MS = 35 * 60 * 1000;        // a peer's announcement stays actionable this long
++const SIGNAL_TICK_MS = 30 * 1000;            // retry unfinished merges this often
++const SIGNAL_BATCH_MS = 1500;                // collect the relay backlog, then act on the newest per peer
++const SIGNAL_ANNOUNCE_DEBOUNCE_MS = 2000;    // coalesce bursts of re-publishes into one announcement
++const MAX_RETRY_COOLDOWN_MS = 10 * 60 * 1000; // exponential back-off ceiling for a peer that keeps failing
++
+ const IMAGE_EXT = new Set([
+   '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.avif', '.ico', '.tif', '.tiff'
+ ]);
+@@ -156,6 +171,18 @@ class BitBoardEngine extends EventEmitter {
+     this._beaconBusy = false;
+     this._bound = false;
+ 
++    // Internet rendezvous: exchange infohashes through a pub/sub relay so
++    // devices on DIFFERENT networks can find each other's torrent.
++    // Disable with { signal: false } or BITBOARD_SIGNAL=off.
++    this.signal = null;
++    if (opts.signal !== false && process.env.BITBOARD_SIGNAL !== 'off') {
++      this.signal = opts.signal || new SignalChannel({
++        baseUrl: opts.signalUrl,
++        log: (m) => this.emit('log', m)
++      });
++    }
++    this._signalTimers = [];
++
+     // Async bootstrap: load ESM deps, create the torrent client, then
+     // restore the boards saved from the previous run.
+     this._ready = (async () => {
+@@ -165,6 +192,7 @@ class BitBoardEngine extends EventEmitter {
+       this.client = new WebTorrent({ dht: true, lsd: true, utp: false, maxConns: 200 });
+       this.client.on('error', (err) => this.emit('log', 'client error: ' + err.message));
+       this.client.on('torrent', () => this._emitBoardsChanged());
++      this._startSignalTimers();
+       await this._restoreBoards();
+     })();
+   }
+@@ -184,6 +212,12 @@ class BitBoardEngine extends EventEmitter {
+       merging: new Set(),            // peer infohashes being fetched right now
+       retryAt: new Map(),            // peer infohash -> earliest retry time
+       lanPeers: new Map(),           // LAN peerId -> last beacon time
++      signalPeers: new Map(),        // relay peerId -> { hash, at } (internet peers)
++      signalInbox: new Map(),        // relay peerId -> newest raw message, until flushed
++      failCount: new Map(),          // peer infohash -> consecutive failed merges
++      _sub: null,                    // relay subscription
++      _announceTimer: null,
++      _flushTimer: null,
+       _chain: Promise.resolve()      // serialises (re)publishing
+     };
+   }
+@@ -226,6 +260,7 @@ class BitBoardEngine extends EventEmitter {
+       fs.mkdirSync(this.boardDir(name), { recursive: true });
+       const board = this._newBoard(name, saved[name].createdAt);
+       this.boards.set(name, board);
++      this._startSignal(board);
+       this._scanFiles(board);
+       this._emitBoardsChanged();
+       try {
+@@ -262,11 +297,13 @@ class BitBoardEngine extends EventEmitter {
+       fs.mkdirSync(this.boardDir(name), { recursive: true });
+       const board = this._newBoard(name);
+       this.boards.set(name, board);
++      this._startSignal(board);
+       this._emitBoardsChanged();   // show the board in the UI right away
+ 
+       try {
+         await this._publishLocked(board);
+       } catch (err) {
++        this._stopSignal(board);
+         this.boards.delete(name);
+         this._emitBoardsChanged();
+         this.emit('log', `failed to ${verb === 'joined' ? 'join' : 'create'} board "${name}": ${err.message}`);
+@@ -369,6 +406,7 @@ class BitBoardEngine extends EventEmitter {
+         this._scanFiles(board);
+         torrent.on('wire', () => this.emit('log', `peer connected to "${board.name}" swarm`));
+         this._emitBoardsChanged();
++        this._scheduleAnnounce(board);   // tell internet peers our new infohash
+         finish(null, torrent);
+       });
+     });
+@@ -440,18 +478,34 @@ class BitBoardEngine extends EventEmitter {
+       this._connectDirect(board.torrent, addr, port);
+       return;
+     }
++    this._tryMerge(board, hash, addr, port);
++  }
++
++  /**
++   * Merge a peer's torrent `hash` into `board` unless we already did, are doing
++   * it, or failed recently. `addr`/`port` are optional: LAN beacons know where
++   * the peer is; internet announcements don't, and rely on trackers/DHT.
++   */
++  _tryMerge(board, hash, addr, port) {
++    if (hash === board.infoHash) return;
+     if (board.seen.has(hash) || board.merging.has(hash)) return;
+     if ((board.retryAt.get(hash) || 0) > Date.now()) return;
+ 
+-    this._mergeFromPeer(board, hash, addr, port).catch((err) => {
+-      board.retryAt.set(hash, Date.now() + RETRY_COOLDOWN_MS);
+-      this.emit('log', `sync of "${board.name}" from ${addr} failed: ${err.message}`);
++    this._mergeFromPeer(board, hash, addr, port).then(() => {
++      board.failCount.delete(hash);
++    }).catch((err) => {
++      // Exponential back-off so an offline peer isn't hammered.
++      const n = (board.failCount.get(hash) || 0) + 1;
++      board.failCount.set(hash, n);
++      const wait = Math.min(RETRY_COOLDOWN_MS * Math.pow(2, n - 1), MAX_RETRY_COOLDOWN_MS);
++      board.retryAt.set(hash, Date.now() + wait);
++      this.emit('log', `sync of "${board.name}" from ${addr || 'internet peer'} failed: ${err.message}`);
+     });
+   }
+ 
+   /** Connect straight to a peer we discovered on the LAN (no tracker/DHT). */
+   _connectDirect(torrent, addr, port) {
+-    if (!torrent || torrent.destroyed || !(port > 0)) return;
++    if (!torrent || torrent.destroyed || !addr || !(port > 0)) return;
+     const go = () => { try { torrent.addPeer(`${addr}:${port}`); } catch (_) { } };
+     if (torrent.infoHash) go(); else torrent.once('infoHash', go);
+   }
+@@ -464,7 +518,7 @@ class BitBoardEngine extends EventEmitter {
+       fs.rmSync(stageRoot, { recursive: true, force: true });
+       fs.mkdirSync(stageRoot, { recursive: true });
+ 
+-      this.emit('log', `syncing "${board.name}" from ${addr}…`);
++      this.emit('log', `syncing "${board.name}" from ${addr || 'internet peers (tracker/DHT)'}…`);
+       const staged = await this._fetchStaged(board, hash, stageRoot, addr, port);
+       const added = this._importStaged(board, staged);
+       board.seen.add(hash);
+@@ -592,6 +646,79 @@ class BitBoardEngine extends EventEmitter {
+     return added;
+   }
+ 
++  /* ---------------- internet rendezvous (relay) ---------------- */
++
++  _startSignal(board) {
++    if (!this.signal || board._sub) return;
++    board._sub = this.signal.subscribe(signalTopic(board.name), (msg) => this._onSignal(board, msg));
++  }
++
++  _stopSignal(board) {
++    if (board._sub) { try { board._sub.close(); } catch (_) { } board._sub = null; }
++    clearTimeout(board._announceTimer);
++    clearTimeout(board._flushTimer);
++  }
++
++  /** Periodic work: heartbeat announcements + retry of unfinished merges. */
++  _startSignalTimers() {
++    if (!this.signal || this._signalTimers.length) return;
++    this._signalTimers.push(setInterval(() => {
++      for (const b of this.boards.values()) this._announceNow(b);
++    }, SIGNAL_HEARTBEAT_MS));
++    this._signalTimers.push(setInterval(() => this._signalTick(), SIGNAL_TICK_MS));
++    for (const t of this._signalTimers) if (t.unref) t.unref();
++  }
++
++  _scheduleAnnounce(board) {
++    if (!this.signal || this._destroyed) return;
++    clearTimeout(board._announceTimer);
++    board._announceTimer = setTimeout(() => this._announceNow(board), SIGNAL_ANNOUNCE_DEBOUNCE_MS);
++  }
++
++  _announceNow(board) {
++    if (!this.signal || this._destroyed || !board.torrent) return;
++    this.signal.publish(signalTopic(board.name), {
++      app: 'bitboard',
++      v: 1,
++      peerId: this.peerId(),
++      board: board.name,
++      infoHash: board.infoHash,
++      ts: Date.now()
++    }).catch((err) => this.emit('log', `could not announce "${board.name}": ${err.message}`));
++  }
++
++  /** A relay message for `board`. Batched so a backlog collapses to the newest per peer. */
++  _onSignal(board, msg) {
++    if (this._destroyed || !msg || msg.app !== 'bitboard') return;
++    if (msg.peerId === this.peerId()) return; // our own announcement
++    if (!/^[0-9a-f]{40}$/i.test(String(msg.infoHash || ''))) return;
++    if (typeof msg.peerId !== 'string' || !msg.peerId) return;
++    const prev = board.signalInbox.get(msg.peerId);
++    if (!prev || (Number(msg.ts) || 0) >= (Number(prev.ts) || 0)) board.signalInbox.set(msg.peerId, msg);
++    if (board._flushTimer) return;
++    board._flushTimer = setTimeout(() => {
++      board._flushTimer = null;
++      const batch = [...board.signalInbox.values()];
++      board.signalInbox.clear();
++      for (const m of batch) {
++        const hash = m.infoHash.toLowerCase();
++        board.signalPeers.set(m.peerId, { hash, at: Date.now() });
++        this._tryMerge(board, hash, null, 0);
++      }
++    }, SIGNAL_BATCH_MS);
++  }
++
++  /** Retry merges from internet peers that announced recently but haven't synced yet. */
++  _signalTick() {
++    const now = Date.now();
++    for (const b of this.boards.values()) {
++      for (const [id, p] of b.signalPeers) {
++        if (now - p.at > SIGNAL_TTL_MS) { b.signalPeers.delete(id); continue; }
++        this._tryMerge(b, p.hash, null, 0);
++      }
++    }
++  }
++
+   /* ---------------- LAN discovery (UDP multicast + broadcast) ---------------- */
+ 
+   startDiscovery() {
+@@ -786,6 +913,10 @@ class BitBoardEngine extends EventEmitter {
+ 
+   destroy() {
+     this._destroyed = true;
++    for (const t of this._signalTimers) clearInterval(t);
++    this._signalTimers = [];
++    for (const b of this.boards.values()) this._stopSignal(b);
++    if (this.signal && this.signal.close) try { this.signal.close(); } catch (_) { }
+     if (this.beaconTimer) clearInterval(this.beaconTimer);
+     if (this.socket) try { this.socket.close(); } catch (_) { }
+     if (this.client) try { this.client.destroy(); } catch (_) { }
+diff --git a/src/signal.js b/src/signal.js
+new file mode 100644
+index 0000000..458c6c6
+--- /dev/null
++++ b/src/signal.js
+@@ -0,0 +1,162 @@
++'use strict';
++
++/**
++ * Internet rendezvous for BitBoard.
++ *
++ * WHY THIS EXISTS
++ * Every device seeds its OWN torrent for a board, and that torrent's infohash
++ * is different on every device (it covers mtimes, creation date, ...). Trackers
++ * and the DHT can only match peers that ask for the SAME infohash, so two
++ * devices on different networks could never find each other's torrent. The
++ * only place infohashes were exchanged was the LAN UDP beacon - which is why
++ * sync worked on one Wi-Fi and never across the internet.
++ *
++ * This module gives devices a way to tell each other "for board X, my current
++ * torrent is <infohash>" over the internet. Once a device knows a peer's
++ * infohash, the normal BitTorrent machinery (trackers, DHT, PEX, UPnP, ...)
++ * finds and connects to that peer, and the existing merge code does the rest.
++ *
++ * HOW
++ * A tiny pub/sub relay speaking the ntfy protocol (https://ntfy.sh by
++ * default, override with BITBOARD_SIGNAL_URL to use your own server). One topic
++ * per board; the topic is derived from a hash of the board name, so only
++ * people who know the board name can find it. Only infohashes are sent - never
++ * images, IPs or file names.
++ *
++ * The wire format is mirrored in android/.../engine/SignalChannel.kt.
++ */
++
++const crypto = require('crypto');
++
++const DEFAULT_RELAY = 'https://ntfy.sh';
++
++/** Relay topic for a board. MUST match Protocol.signalTopic() on Android. */
++function signalTopic(boardName) {
++  const h = crypto.createHash('sha256')
++    .update('bitboard-signal-v1:' + String(boardName).trim().toLowerCase())
++    .digest('hex');
++  return 'bitboard-' + h.slice(0, 32);
++}
++
++class SignalChannel {
++  /**
++   * @param {{baseUrl?: string, log?: (s: string) => void}} [opts]
++   */
++  constructor(opts = {}) {
++    this.baseUrl = String(opts.baseUrl || process.env.BITBOARD_SIGNAL_URL || DEFAULT_RELAY).replace(/\/+$/, '');
++    this.log = opts.log || (() => { });
++    this._subs = new Set();
++    this._closed = false;
++  }
++
++  /** Publish one JSON-serialisable object to a topic. */
++  async publish(topic, obj) {
++    const res = await fetch(`${this.baseUrl}/${topic}`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
++      body: JSON.stringify(obj),
++      signal: AbortSignal.timeout(15000)
++    });
++    if (!res.ok) throw new Error(`signal relay answered HTTP ${res.status}`);
++  }
++
++  /**
++   * Subscribe to a topic. Reconnects forever with back-off. `onMessage`
++   * receives each parsed message object (the JSON we published).
++   * Returns { close() }.
++   */
++  subscribe(topic, onMessage, opts = {}) {
++    const sub = { closed: false, ctrl: null, lastId: null, wake: null };
++    this._subs.add(sub);
++    let backoff = 2000;
++
++    const run = async () => {
++      while (!sub.closed && !this._closed) {
++        const ctrl = new AbortController();
++        sub.ctrl = ctrl;
++        let watchdog = null;
++        try {
++          const since = sub.lastId || opts.since || '30m';
++          const res = await fetch(
++            `${this.baseUrl}/${topic}/json?since=${encodeURIComponent(since)}`,
++            { signal: ctrl.signal }
++          );
++          if (!res.ok) {
++            if (res.status === 400) sub.lastId = null; // unknown/expired id
++            throw new Error(`signal relay answered HTTP ${res.status}`);
++          }
++          backoff = 2000;
++
++          // The relay sends a keepalive every ~45 s. Silence for 2 minutes means
++          // a dead connection (very common when a phone switches networks).
++          let lastData = Date.now();
++          watchdog = setInterval(() => {
++            if (Date.now() - lastData > 120000) ctrl.abort();
++          }, 30000);
++
++          const reader = res.body.getReader();
++          const dec = new TextDecoder();
++          let buf = '';
++          for (; ;) {
++            const { done, value } = await reader.read();
++            if (done) break;
++            lastData = Date.now();
++            buf += dec.decode(value, { stream: true });
++            let nl;
++            while ((nl = buf.indexOf('\n')) >= 0) {
++              const line = buf.slice(0, nl).trim();
++              buf = buf.slice(nl + 1);
++              if (line) this._onLine(sub, line, onMessage);
++            }
++          }
++        } catch (err) {
++          if (sub.closed || this._closed) return;
++          this.log(`signal relay: ${err.message} - retrying`);
++        } finally {
++          clearInterval(watchdog);
++        }
++        if (sub.closed || this._closed) return;
++        await new Promise((resolve) => {
++          const t = setTimeout(resolve, backoff);
++          sub.wake = () => { clearTimeout(t); resolve(); };
++        });
++        sub.wake = null;
++        backoff = Math.min(backoff * 2, 60000);
++      }
++    };
++    run();
++
++    return {
++      close: () => {
++        sub.closed = true;
++        this._subs.delete(sub);
++        try { if (sub.ctrl) sub.ctrl.abort(); } catch (_) { }
++        if (sub.wake) sub.wake();
++      }
++    };
++  }
++
++  _onLine(sub, line, onMessage) {
++    let ev;
++    try { ev = JSON.parse(line); } catch (_) { return; }
++    if (!ev || ev.event !== 'message') return;
++    if (ev.id) sub.lastId = ev.id;
++    let payload;
++    try { payload = JSON.parse(ev.message); } catch (_) { return; }
++    if (payload && typeof payload === 'object') {
++      try { onMessage(payload); } catch (_) { /* a bad handler must not kill the stream */ }
++    }
++  }
++
++  close() {
++    this._closed = true;
++    for (const s of [...this._subs]) {
++      s.closed = true;
++      try { if (s.ctrl) s.ctrl.abort(); } catch (_) { }
++      if (s.wake) s.wake();
++    }
++    this._subs.clear();
++  }
++}
++
++module.exports = { SignalChannel, signalTopic, DEFAULT_RELAY };
+diff --git a/test/signal-test.js b/test/signal-test.js
+new file mode 100644
+index 0000000..430f3ab
+--- /dev/null
++++ b/test/signal-test.js
+@@ -0,0 +1,93 @@
++'use strict';
++/**
++ * End-to-end test of INTERNET rendezvous, with no LAN beacon involved.
++ *
++ *  - a mock ntfy-style relay runs on localhost;
++ *  - two engines (separate data dirs, discovery NOT started) share only that relay;
++ *  - the test plays the role of "tracker/DHT" by handing B the address of A's
++ *    torrent port once B is looking for A's infohash (in real life the
++ *    trackers / DHT do that).
++ *
++ * Run: node test/signal-test.js
++ */
++const http = require('http');
++const fs = require('fs');
++const os = require('os');
++const path = require('path');
++const assert = require('assert');
++
++process.env.BITBOARD_SIGNAL = process.env.BITBOARD_SIGNAL || 'on';
++const { BitBoardEngine } = require('../src/engine');
++const { signalTopic } = require('../src/signal');
++
++function startRelay() {
++  const topics = new Map(); // topic -> { msgs: [], subs: Set<res> }
++  const get = (t) => { if (!topics.has(t)) topics.set(t, { msgs: [], subs: new Set() }); return topics.get(t); };
++  let seq = 0;
++  const server = http.createServer((req, res) => {
++    const m = /^\/([^/?]+)(\/json)?/.exec(req.url);
++    if (!m) { res.writeHead(404).end(); return; }
++    const t = get(m[1]);
++    if (req.method === 'POST') {
++      let body = '';
++      req.on('data', (c) => body += c);
++      req.on('end', () => {
++        const ev = { id: 'm' + (++seq), time: Math.floor(Date.now() / 1000), event: 'message', topic: m[1], message: body };
++        t.msgs.push(ev);
++        for (const s of t.subs) s.write(JSON.stringify(ev) + '\n');
++        res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(ev));
++      });
++    } else if (m[2]) {
++      res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
++      res.write(JSON.stringify({ id: 'o', event: 'open', topic: m[1] }) + '\n');
++      for (const ev of t.msgs) res.write(JSON.stringify(ev) + '\n');
++      t.subs.add(res);
++      req.on('close', () => t.subs.delete(res));
++    } else res.writeHead(404).end();
++  });
++  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, url: 'http://127.0.0.1:' + server.address().port, topics })));
++}
++
++const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
++async function waitFor(fn, ms, what) {
++  const t0 = Date.now();
++  while (Date.now() - t0 < ms) { if (await fn()) return; await sleep(250); }
++  throw new Error('timeout waiting for ' + what);
++}
++
++(async () => {
++  const relay = await startRelay();
++  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bb-sig-'));
++  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
++  const img = path.join(tmp, 'hello.png');
++  fs.writeFileSync(img, png);
++
++  const A = new BitBoardEngine({ dataDir: path.join(tmp, 'A'), signalUrl: relay.url });
++  const B = new BitBoardEngine({ dataDir: path.join(tmp, 'B'), signalUrl: relay.url });
++  A.on('log', (l) => console.log('[A]', l));
++  B.on('log', (l) => console.log('[B]', l));
++  await A.ready(); await B.ready();
++
++  await A.createBoard('Vacation');
++  await A.addImage('Vacation', img);
++  await B.joinBoard('Vacation');           // same name, different "network"
++
++  // Stand-in for tracker/DHT peer exchange.
++  const matchmaker = setInterval(() => {
++    const hashA = A.boards.get('Vacation').infoHash;
++    for (const t of B.client.torrents) {
++      if (t.infoHash === hashA && t.numPeers === 0) { try { t.addPeer('127.0.0.1:' + A.client.torrentPort); } catch (_) { } }
++    }
++  }, 500);
++
++  try {
++    await waitFor(() => fs.existsSync(path.join(B.boards.get('Vacation').dir, 'hello.png')), 60000, 'B to receive hello.png over the relay');
++    assert.ok(relay.topics.has(signalTopic('Vacation')), 'announcements used the derived topic');
++    console.log('\nPASS: B received the image from A via internet rendezvous (no LAN beacon)');
++  } finally {
++    clearInterval(matchmaker);
++    A.destroy(); B.destroy(); relay.server.closeAllConnections?.(); relay.server.close();
++    fs.rmSync(tmp, { recursive: true, force: true });
++    setTimeout(() => process.exit(process.exitCode || 0), 300);
++  }
++})().catch((e) => { console.error('FAIL:', e.message); process.exit(1); });
+-- 
+2.43.0
+
