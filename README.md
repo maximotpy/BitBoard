@@ -1,7 +1,6 @@
 # BitBoard
 
-P2P image replication between devices — a monorepo containing two clients
-that share the same protocol and sync model:
+P2P image replication between devices
 
 | Folder   | Client            | Stack                          |
 |----------|-------------------|--------------------------------|
