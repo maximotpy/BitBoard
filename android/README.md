@@ -18,10 +18,17 @@ The wire protocol is identical on both platforms:
 - **Board folder**: `sha1(name.trim().toLowerCase())` hex, first 16 chars.
 - **Manifest**: `bitboard-manifest.json` (visible, not dot-prefixed) with
   `{board, createdAt, files:[{name, size, mtime}]}`.
-- **Torrent name**: `bitboard-<boardName>`, trackers: opentrackr + open.tracker.cl.
-- **LAN beacon**: JSON `{app:"bitboard", peerId, host, boards:[{name, infoHash}]}`
-  on `239.255.66.66:45666` every 3 s. The beacon carries the **real
-  content-derived infohash** — that is how joiners find the swarm.
+- **Torrent name**: the board folder's basename, trackers: opentrackr + open.tracker.cl. Torrents are **v1-only** (WebTorrent cannot read hybrid v1+v2).
+- **LAN beacon**: JSON `{app:"bitboard", v:2, peerId, host, port, reply, boards:[{name, infoHash}]}`
+  on multicast `239.255.66.66:45666` **and** the subnet broadcast address,
+  every 3 s, on every network interface. `port` is the sender's BitTorrent TCP
+  port; receivers connect to it directly. New peers get a unicast `reply` beacon.
+- **Sync = merge, not swarm switching.** Two devices never share an infohash
+  for the same board (it covers mtimes, creation date, creator string).
+  Each device seeds its own folder; on a beacon with an unseen hash it fetches
+  that torrent into a staging folder (only the images it lacks), copies them
+  in and republishes. Each peer hash is merged once, so devices converge.
+  Same-name/different-content images are both kept (`name-<sha1 prefix>.ext`).
 
 ## Project layout
 
@@ -67,7 +74,3 @@ backgrounded.
 - WebTorrent's WebRTC trackers are not used on Android (libtorrent speaks
   BitTorrent over TCP/UDP); sync works via DHT, UDP trackers, LSD and the LAN
   beacon — which covers LAN and most internet scenarios.
-- The desktop engine (`src/engine.js`) was updated so its LAN beacon handler
-  passes the real infohash to `joinBoard()` — required for cross-platform
-  sync, since the deterministic name-hash never equals a seeded torrent's
-  content-derived infohash.

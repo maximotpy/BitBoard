@@ -13,12 +13,14 @@ import com.bitboard.app.engine.BitBoardEngine.BoardSnapshot
 
 /**
  * RecyclerView adapter mirroring the desktop UI: a list of boards, each with
- * file count / peers / progress, an "Add image" button, and a "Join board"
- * row at the bottom.
+ * file count / peers / progress, an "Add image" button, a "Join board" row,
+ * and a "Discovered on network" section listing boards other devices
+ * announced that this device has NOT joined (nothing is auto-joined).
  */
 class BoardAdapter(
     private val onAddImage: (String) -> Unit,
     private val onJoin: () -> Unit,
+    private val onJoinDiscovered: (String) -> Unit = {},
     private val onOpenBoard: (String) -> Unit = {}
 ) : ListAdapter<BoardSnapshot, RecyclerView.ViewHolder>(DIFF) {
 
@@ -26,22 +28,36 @@ class BoardAdapter(
         private const val TYPE_BOARD = 0
         private const val TYPE_JOIN = 1
         private const val TYPE_EMPTY = 2
+        private const val TYPE_DISCOVERED_HEADER = 3
+        private const val TYPE_DISCOVERED = 4
     }
 
     private var items: List<BoardSnapshot> = emptyList()
+    private var discovered: List<String> = emptyList()
 
     fun submit(list: List<BoardSnapshot>) {
         items = list
         submitList(list)
     }
 
-    override fun getItemCount(): Int =
-        if (items.isEmpty()) 1 else items.size + 1
+    fun submitDiscovered(names: List<String>) {
+        discovered = names.filter { n -> items.none { it.name == n } }
+        submitList(items)
+    }
+
+    private fun discoveredCount(): Int = if (discovered.isEmpty()) 0 else discovered.size + 1
+
+    override fun getItemCount(): Int {
+        if (items.isEmpty()) return 1 + discoveredCount()
+        return items.size + 1 + discoveredCount()
+    }
 
     override fun getItemViewType(position: Int): Int = when {
-        items.isEmpty() -> TYPE_EMPTY
+        items.isEmpty() && position == 0 -> TYPE_EMPTY
         position < items.size -> TYPE_BOARD
-        else -> TYPE_JOIN
+        position == items.size -> TYPE_JOIN
+        position == items.size + 1 && discovered.isNotEmpty() -> TYPE_DISCOVERED_HEADER
+        else -> TYPE_DISCOVERED
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
@@ -49,6 +65,8 @@ class BoardAdapter(
         return when (viewType) {
             TYPE_BOARD -> BoardHolder(inf.inflate(R.layout.item_board, parent, false))
             TYPE_JOIN -> JoinHolder(inf.inflate(R.layout.item_join, parent, false))
+            TYPE_DISCOVERED_HEADER -> DiscoveredHeaderHolder(inf.inflate(R.layout.item_discovered_header, parent, false))
+            TYPE_DISCOVERED -> DiscoveredHolder(inf.inflate(R.layout.item_discovered, parent, false))
             else -> EmptyHolder(inf.inflate(R.layout.item_empty, parent, false))
         }
     }
@@ -57,7 +75,8 @@ class BoardAdapter(
         when (holder) {
             is BoardHolder -> holder.bind(items[position], onAddImage, onOpenBoard)
             is JoinHolder -> holder.bind(onJoin)
-            is EmptyHolder -> Unit
+            is DiscoveredHolder -> holder.bind(discovered[position - items.size - 2], onJoinDiscovered)
+            else -> Unit
         }
     }
 
@@ -88,6 +107,17 @@ class BoardAdapter(
         private val btn: Button = v.findViewById(R.id.btnJoinBoard)
         fun bind(onJoin: () -> Unit) {
             btn.setOnClickListener { onJoin() }
+        }
+    }
+
+    class DiscoveredHeaderHolder(v: View) : RecyclerView.ViewHolder(v)
+
+    class DiscoveredHolder(v: View) : RecyclerView.ViewHolder(v) {
+        private val name: TextView = v.findViewById(R.id.discoveredName)
+        private val btn: Button = v.findViewById(R.id.btnJoinDiscovered)
+        fun bind(boardName: String, onJoinDiscovered: (String) -> Unit) {
+            name.text = boardName
+            btn.setOnClickListener { onJoinDiscovered(boardName) }
         }
     }
 

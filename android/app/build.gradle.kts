@@ -15,9 +15,16 @@ android {
         versionName = "1.0"
 
         ndk {
-            // libtorrent4j prebuilt natives; arm64 covers modern devices,
-            // x86_64 covers emulators.
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+        }
+    }
+
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("x86", "x86_64", "arm64-v8a", "armeabi-v7a")
+            isUniversalApk = true
         }
     }
 
@@ -42,7 +49,9 @@ android {
 dependencies {
     // libtorrent4j: Java classes + prebuilt libtorrent natives per ABI
     implementation("org.libtorrent4j:libtorrent4j:2.1.0-39")
+    implementation("org.libtorrent4j:libtorrent4j-android-arm:2.1.0-39")
     implementation("org.libtorrent4j:libtorrent4j-android-arm64:2.1.0-39")
+    implementation("org.libtorrent4j:libtorrent4j-android-x86:2.1.0-39")
     implementation("org.libtorrent4j:libtorrent4j-android-x86_64:2.1.0-39")
 
     implementation("androidx.core:core-ktx:1.13.1")

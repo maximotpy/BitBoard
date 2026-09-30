@@ -20,6 +20,7 @@ const els = {
 };
 
 let boards = [];
+let discovered = [];           // boards seen on the LAN but not joined
 let selectedBoard = null;
 let currentView = 'gallery';   // 'gallery' (image board) | 'details' (file list)
 let lightboxFiles = [];        // files of the board shown in the lightbox
@@ -60,6 +61,41 @@ function renderBoardList() {
       renderContent();
     });
     els.boardList.appendChild(item);
+  }
+
+  // Boards other devices announced on the LAN that we have NOT joined.
+  // They are offered here — nothing is ever auto-joined.
+  const offerable = discovered.filter(n => !boards.some(b => b.name === n));
+  if (offerable.length) {
+    const head = document.createElement('div');
+    head.className = 'discovered-header';
+    head.textContent = 'Discovered on network';
+    els.boardList.appendChild(head);
+
+    for (const name of offerable) {
+      const item = document.createElement('div');
+      item.className = 'board-item discovered-item';
+      item.title = 'Join "' + name + '"';
+
+      const icon = document.createElement('span');
+      icon.className = 'board-icon';
+      icon.textContent = '\u2609';
+
+      const nameEl = document.createElement('span');
+      nameEl.className = 'board-name';
+      nameEl.textContent = name;
+
+      item.appendChild(icon);
+      item.appendChild(nameEl);
+      item.addEventListener('click', () => {
+        window.bitboard.joinBoard(name).catch((err) => {
+          const msg = String((err && err.message) || err)
+            .replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+          logLine('Failed to join "' + name + '": ' + msg);
+        });
+      });
+      els.boardList.appendChild(item);
+    }
   }
 }
 
@@ -271,7 +307,7 @@ modal.input.addEventListener('keydown', (e) => {
 async function promptAndRun(title, action, failLabel) {
   let name = '';
   let errorText = '';
-  for (;;) {
+  for (; ;) {
     name = await askBoardName(title, name, errorText);
     if (!name) return;
     try {
@@ -308,6 +344,11 @@ window.bitboard.onBoards((snapshot) => {
   renderContent();
 });
 
+window.bitboard.onDiscovered((names) => {
+  discovered = names || [];
+  renderBoardList();
+});
+
 function logLine(line) {
   const div = document.createElement('div');
   div.textContent = line;
@@ -322,6 +363,7 @@ window.bitboard.onLog(logLine);
 
 (async () => {
   boards = await window.bitboard.getBoards();
+  discovered = await window.bitboard.getDiscovered();
   if (boards.length) selectedBoard = boards[0].name;
   renderBoardList();
   renderContent();

@@ -19,7 +19,8 @@
   --row-alt: #242424;
 }
 
-html, body {
+html,
+body {
   height: 100%;
   background: var(--bg);
   color: var(--text);
@@ -34,7 +35,8 @@ html, body {
 /* ---------------- Sidebar ---------------- */
 
 #sidebar {
-  width: 56px;                       /* collapsed: icons only */
+  width: 56px;
+  /* collapsed: icons only */
   min-width: 56px;
   background: var(--sidebar);
   display: flex;
@@ -47,7 +49,8 @@ html, body {
 /* Expanded when hovered OR pinned by keyboard focus */
 #sidebar:hover,
 #sidebar:focus-within {
-  width: 14.28vw;                   /* ~1/7 of the screen */
+  width: 14.28vw;
+  /* ~1/7 of the screen */
   min-width: 14.28vw;
 }
 
@@ -76,7 +79,9 @@ html, body {
 }
 
 #sidebar:hover .brand-label,
-#sidebar:focus-within .brand-label { opacity: 1; }
+#sidebar:focus-within .brand-label {
+  opacity: 1;
+}
 
 #board-list {
   flex: 1;
@@ -93,8 +98,14 @@ html, body {
   color: var(--text-dim);
 }
 
-.board-item:hover { background: var(--sidebar-hover); }
-.board-item.active { background: var(--sidebar-active); color: var(--text); }
+.board-item:hover {
+  background: var(--sidebar-hover);
+}
+
+.board-item.active {
+  background: var(--sidebar-active);
+  color: var(--text);
+}
 
 .board-icon {
   flex: 0 0 56px;
@@ -112,7 +123,30 @@ html, body {
 }
 
 #sidebar:hover .board-name,
-#sidebar:focus-within .board-name { opacity: 1; }
+#sidebar:focus-within .board-name {
+  opacity: 1;
+}
+
+/* Boards announced by other devices on the LAN, offered for joining. */
+.discovered-header {
+  padding: 10px 0 4px 56px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #7a7a7a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.discovered-item {
+  color: #9a9a9a;
+  font-style: italic;
+}
+
+.discovered-item:hover {
+  color: var(--text);
+}
 
 #sidebar-actions {
   border-top: 1px solid #111;
@@ -132,7 +166,10 @@ html, body {
   font-size: 13px;
 }
 
-.side-btn:hover { background: var(--sidebar-hover); color: var(--text); }
+.side-btn:hover {
+  background: var(--sidebar-hover);
+  color: var(--text);
+}
 
 .btn-icon {
   flex: 0 0 56px;
@@ -147,7 +184,9 @@ html, body {
 }
 
 #sidebar:hover .btn-label,
-#sidebar:focus-within .btn-label { opacity: 1; }
+#sidebar:focus-within .btn-label {
+  opacity: 1;
+}
 
 #sidebar-footer {
   border-top: 1px solid #111;
@@ -167,7 +206,9 @@ html, body {
 }
 
 #sidebar:hover #log,
-#sidebar:focus-within #log { opacity: 1; }
+#sidebar:focus-within #log {
+  opacity: 1;
+}
 
 /* ---------------- Content ---------------- */
 
@@ -207,8 +248,15 @@ html, body {
   cursor: pointer;
 }
 
-.flat-btn:hover { background: #7d7d7d; }
-.flat-btn:disabled { background: #3a3a3a; color: var(--text-dim); cursor: default; }
+.flat-btn:hover {
+  background: #7d7d7d;
+}
+
+.flat-btn:disabled {
+  background: #3a3a3a;
+  color: var(--text-dim);
+  cursor: default;
+}
 
 /* ---------------- View tabs (Gallery / Details) ---------------- */
 
@@ -227,7 +275,9 @@ html, body {
   cursor: pointer;
 }
 
-.tab-btn:hover { color: var(--text); }
+.tab-btn:hover {
+  color: var(--text);
+}
 
 .tab-btn.active {
   color: var(--text);
@@ -242,9 +292,23 @@ html, body {
   column-gap: 12px;
 }
 
-@media (max-width: 1400px) { #image-gallery { column-count: 4; } }
-@media (max-width: 1100px) { #image-gallery { column-count: 3; } }
-@media (max-width: 800px)  { #image-gallery { column-count: 2; } }
+@media (max-width: 1400px) {
+  #image-gallery {
+    column-count: 4;
+  }
+}
+
+@media (max-width: 1100px) {
+  #image-gallery {
+    column-count: 3;
+  }
+}
+
+@media (max-width: 800px) {
+  #image-gallery {
+    column-count: 2;
+  }
+}
 
 .gallery-tile {
   break-inside: avoid;
@@ -254,7 +318,9 @@ html, body {
   cursor: pointer;
 }
 
-.gallery-tile:hover { border-color: var(--accent); }
+.gallery-tile:hover {
+  border-color: var(--accent);
+}
 
 .gallery-img {
   display: block;
@@ -288,7 +354,9 @@ html, body {
   white-space: nowrap;
 }
 
-.gallery-size { flex: 0 0 auto; }
+.gallery-size {
+  flex: 0 0 auto;
+}
 
 /* ---------------- Lightbox ---------------- */
 
@@ -303,7 +371,9 @@ html, body {
   cursor: zoom-out;
 }
 
-#lightbox.hidden { display: none; }
+#lightbox.hidden {
+  display: none;
+}
 
 #lightbox-inner {
   max-width: 92vw;
@@ -341,7 +411,9 @@ html, body {
   border-bottom: 1px solid #111;
 }
 
-.file-row:nth-child(even) { background: var(--row-alt); }
+.file-row:nth-child(even) {
+  background: var(--row-alt);
+}
 
 .file-thumb {
   width: 48px;
@@ -365,7 +437,10 @@ html, body {
   font-size: 18px;
 }
 
-.file-info { flex: 1; min-width: 0; }
+.file-info {
+  flex: 1;
+  min-width: 0;
+}
 
 .file-name {
   font-size: 13px;
@@ -394,13 +469,23 @@ html, body {
   font-size: 13px;
 }
 
-::-webkit-scrollbar { width: 8px; }
-::-webkit-scrollbar-thumb { background: #3a3a3a; }
-::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3a3a3a;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
 
 /* ---------------- Modal (flat, sharp corners) ---------------- */
 
-.hidden { display: none; }
+.hidden {
+  display: none;
+}
 
 #modal-backdrop {
   position: fixed;
@@ -413,7 +498,9 @@ html, body {
 }
 
 /* Must outrank the ID rule above — class-only .hidden loses on specificity. */
-#modal-backdrop.hidden { display: none; }
+#modal-backdrop.hidden {
+  display: none;
+}
 
 #modal {
   width: 360px;
@@ -438,7 +525,9 @@ html, body {
   outline: none;
 }
 
-#modal-input:focus { border-color: var(--accent); }
+#modal-input:focus {
+  border-color: var(--accent);
+}
 
 #modal-error {
   color: #e07070;

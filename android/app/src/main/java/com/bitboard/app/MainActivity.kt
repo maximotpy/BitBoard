@@ -48,6 +48,7 @@ class MainActivity : AppCompatActivity() {
         adapter = BoardAdapter(
             onAddImage = { name -> pickImage(name) },
             onJoin = { showJoinDialog() },
+            onJoinDiscovered = { name -> joinDiscovered(name) },
             onOpenBoard = { name ->
                 startActivity(
                     Intent(this, BoardActivity::class.java)
@@ -70,6 +71,9 @@ class MainActivity : AppCompatActivity() {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 launch {
                     App.engine(applicationContext).boards.collect { adapter.submit(it) }
+                }
+                launch {
+                    App.engine(applicationContext).discovered.collect { adapter.submitDiscovered(it) }
                 }
                 launch {
                     App.engine(applicationContext).logs.collect { logs ->
@@ -101,6 +105,16 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun joinDiscovered(name: String) {
+        lifecycleScope.launch {
+            try {
+                App.engine(applicationContext).joinBoard(name)
+            } catch (e: Exception) {
+                Toast.makeText(this@MainActivity, e.message, Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun showJoinDialog() {

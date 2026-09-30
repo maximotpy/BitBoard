@@ -1,3 +1,24 @@
 node_modules/
 data/
 *.log
+
+# --- Android ---
+# Machine-specific SDK location
+android/local.properties
+
+# Gradle build outputs and caches
+android/.gradle/
+android/app/build/
+android/build/
+
+# Precompiled artifacts (APK / AAB bundles)
+*.apk
+*.aab
+
+# Android Studio / IntelliJ project files
+.idea/
+*.iml
+
+# OS noise
+.DS_Store
+Thumbs.db

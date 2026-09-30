@@ -5,39 +5,54 @@ import android.os.Build
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import org.libtorrent4j.AlertListener
+import org.libtorrent4j.Priority
 import org.libtorrent4j.SessionManager
 import org.libtorrent4j.SessionParams
 import org.libtorrent4j.SettingsPack
+import org.libtorrent4j.Sha1Hash
+import org.libtorrent4j.TcpEndpoint
 import org.libtorrent4j.TorrentBuilder
 import org.libtorrent4j.TorrentHandle
 import org.libtorrent4j.TorrentInfo
 import org.libtorrent4j.alerts.AddTorrentAlert
 import org.libtorrent4j.alerts.Alert
-import org.libtorrent4j.alerts.MetadataReceivedAlert
-import org.libtorrent4j.alerts.TorrentFinishedAlert
+import org.libtorrent4j.swig.torrent_flags_t
 import java.io.File
+import java.io.IOException
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.runBlocking
 
 /**
- * BitBoard P2P engine for Android — a faithful port of the desktop engine
- * (src/engine.js) on top of libtorrent4j.
+ * BitBoard P2P engine for Android — port of the desktop engine (src/engine.js)
+ * on top of libtorrent4j.
  *
- * Every "board" is a folder of images published as a BitTorrent. Devices that
- * join the same board seed and leech simultaneously, so images replicate
- * automatically — cloud-like sync with no cloud.
+ * Every "board" is a folder of images that this device seeds as its OWN
+ * torrent. Devices never share an infohash for "the same" board (the hash
+ * covers mtimes, the creation date, the creator string, …), so replication is
+ * a MERGE, not a swarm switch:
  *
- * Discovery:
- *  - DHT + UDP trackers (cross-network)
- *  - LAN UDP multicast beacon (same-network instant discovery), identical
- *    wire format to the desktop app so the two interoperate.
+ *   1. a LAN beacon says "peer P has board B as torrent H at ip:port";
+ *   2. if we haven't merged H yet, fetch H into a staging folder — connecting
+ *      straight to ip:port (no tracker/DHT needed) and downloading ONLY the
+ *      images we don't already have;
+ *   3. copy them into our board folder and re-publish our own torrent.
+ *
+ * Each distinct peer hash is merged at most once, so two devices converge
+ * instead of endlessly abandoning each other's swarm.
  */
 class BitBoardEngine(val context: Context) {
 
@@ -56,7 +71,8 @@ class BitBoardEngine(val context: Context) {
         val totalBytes: Long,
         val peers: Int,
         val progress: Float,
-        val files: List<FileMeta>
+        val files: List<FileMeta>,
+        val syncing: Boolean = false
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -70,43 +86,44 @@ class BitBoardEngine(val context: Context) {
     private val _discovered = MutableStateFlow<List<String>>(emptyList())
     val discovered: StateFlow<List<String>> = _discovered
 
+    /** name -> last beacon time for boards seen on the LAN but NOT joined. */
+    private val discoveredMap = ConcurrentHashMap<String, Long>()
+
     private lateinit var dataDir: File
     private lateinit var boardsDir: File
     private lateinit var torrentsDir: File
+    private lateinit var stagingDir: File
     private lateinit var stateFile: File
     private lateinit var peerIdFile: File
 
     private val session = SessionManager()
-    private val boardMap = LinkedHashMap<String, Board>() // name -> board
+    private val boardMap = ConcurrentHashMap<String, Board>() // name -> board
+    private val ensureMutex = Mutex()
+    private var discovery: LanDiscovery? = null
     private var peerId: String = ""
-    private var started = false
+    @Volatile private var started = false
 
     /**
      * Single-threaded dispatcher that serializes ALL access to libtorrent
      * native objects (session + torrent handles). libtorrent4j's Java
      * wrappers are NOT thread-safe: a TorrentHandle freed by session.remove()
      * on one thread segfaults if another thread calls status()/infoHash() on
-     * it concurrently. Routing every native touch through this one thread
-     * eliminates the use-after-free race that crashed create/join.
+     * it concurrently.
      */
     private val ltExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "bitboard-lt").apply { isDaemon = true }
     }
     private val ltDispatcher = ltExecutor.asCoroutineDispatcher()
 
-    /** Run [block] on the libtorrent thread and wait for the result. If the
-     *  caller is ALREADY the lt thread (e.g. scanFiles/snapshot invoked from
-     *  within a postLt block), run inline to avoid self-deadlock. Other
-     *  callers are coroutines on Dispatchers.IO (never the UI thread and
-     *  never libtorrent's alert thread). */
+    /** Run [block] on the libtorrent thread and wait for the result. Runs
+     *  inline if the caller already IS the lt thread. Callers are coroutines
+     *  on Dispatchers.IO (never the UI thread, never libtorrent's alert
+     *  thread). */
     private fun <T> onLt(block: () -> T): T =
         if (Thread.currentThread().name == "bitboard-lt") block()
         else runBlocking(ltDispatcher) { block() }
 
-    /** Post [block] to the libtorrent thread WITHOUT waiting. Used from the
-     *  alert listener, which runs on libtorrent's own internal thread —
-     *  blocking that thread (onLt) would deadlock against session.* calls
-     *  executing on the lt thread. */
+    /** Post [block] to the libtorrent thread WITHOUT waiting. */
     private fun postLt(block: () -> Unit) {
         ltExecutor.execute {
             try { block() } catch (_: Throwable) {}
@@ -117,12 +134,20 @@ class BitBoardEngine(val context: Context) {
     private class Board(
         val name: String,
         val dir: File,
-        var infoHash: String,
-        var handle: TorrentHandle? = null,
-        val files: LinkedHashMap<String, FileMeta> = LinkedHashMap(),
-        var createdAt: Long = System.currentTimeMillis(),
-        var migrating: Boolean = false
-    )
+        val createdAt: Long
+    ) {
+        /** Real infohash of OUR torrent (valid once [handle] != null). */
+        @Volatile var infoHash: String = Protocol.boardInfoHash(name)
+        /** Handle of OUR seeding torrent. Only touched on the lt thread. */
+        @Volatile var handle: TorrentHandle? = null
+        val files = ConcurrentHashMap<String, FileMeta>()
+        val seen: MutableSet<String> = ConcurrentHashMap.newKeySet()      // peer hashes merged
+        val merging: MutableSet<String> = ConcurrentHashMap.newKeySet()   // peer hashes in flight
+        val retryAt = ConcurrentHashMap<String, Long>()
+        val lanPeers = ConcurrentHashMap<String, Long>()                  // peerId -> last beacon
+        val publishLock = Mutex()
+        @Volatile var mergeProgress = 1f
+    }
 
     /* ------------------------------------------------------------------ */
     /* lifecycle                                                           */
@@ -135,6 +160,7 @@ class BitBoardEngine(val context: Context) {
         dataDir = File(context.filesDir, "data").apply { mkdirs() }
         boardsDir = File(dataDir, "boards").apply { mkdirs() }
         torrentsDir = File(dataDir, "torrents").apply { mkdirs() }
+        stagingDir = File(dataDir, "staging").apply { deleteRecursively(); mkdirs() }
         stateFile = File(dataDir, "state.json")
         peerIdFile = File(dataDir, "peer-id")
 
@@ -148,8 +174,10 @@ class BitBoardEngine(val context: Context) {
 
         scope.launch {
             startSession()
+            // Start discovery BEFORE restoring boards: restoring re-seeds every
+            // board (slow), and beacons must not wait for that.
+            discovery = LanDiscovery(this@BitBoardEngine).also { it.start() }
             restoreBoards()
-            LanDiscovery(this@BitBoardEngine).start()
         }
     }
 
@@ -164,93 +192,48 @@ class BitBoardEngine(val context: Context) {
             connectionsLimit(200)
         }
         val params = SessionParams(sp)
-        params.setDefaultDiskIO()
+        // POSIX disk I/O, NOT the default mmap one: mmap is unstable on Android
+        // (SIGSEGV / SIGBUS on the disk thread while seeding).
+        params.setPosixDiskIO()
         session.addListener(alertListener)
         session.start(params)
-        log("session started (DHT + LSD)")
+        log("session started (DHT + LSD), port ${listenPort()}")
     }
 
     fun stop() {
         if (!started) return
         started = false
+        try { discovery?.stop() } catch (_: Exception) {}
+        discovery = null
         try { session.stop() } catch (_: Exception) {}
+    }
+
+    /** The TCP/uTP port libtorrent really listens on (announced in beacons). */
+    fun listenPort(): Int = try {
+        val p = session.swig().listen_port()
+        if (p > 0) p else 6881
+    } catch (_: Throwable) {
+        6881
     }
 
     /* ------------------------------------------------------------------ */
     /* alerts                                                              */
     /* ------------------------------------------------------------------ */
 
+    /** Only used for diagnostics. Torrent handles are looked up by infohash
+     *  (session.find) — never wired from alerts — so a torrent can never be
+     *  attached to the wrong board. */
     private val alertListener = object : AlertListener {
         override fun types(): IntArray? = null // all alerts
 
         override fun alert(a: Alert<*>) {
-            // This callback runs on libtorrent's internal thread for EVERY
-            // alert type. Any exception escaping it crashes the process, so
-            // everything here must be guarded.
+            // Runs on libtorrent's internal thread; nothing may escape.
             try {
-                when (a) {
-                    is AddTorrentAlert -> onTorrentAdded(a)
-                    is MetadataReceivedAlert -> log("metadata received")
-                    is TorrentFinishedAlert -> {
-                        val h = safeHandle(a) ?: return
-                        postLt {
-                            val b = boardByHandle(h)
-                            if (b != null) {
-                                log("board \"${b.name}\" fully synced")
-                                scanFiles(b)
-                                publishBoards()
-                            }
-                        }
-                    }
+                if (a is AddTorrentAlert) {
+                    val err = a.error()
+                    if (err != null && err.isError) log("add torrent failed: ${err.message}")
                 }
-            } catch (e: Exception) {
-                log("alert error: ${e.message}")
-            }
-        }
-    }
-
-    /** Returns the alert's torrent handle, or null if it cannot be read.
-     *  NOTE: a handle obtained from an alert is always freshly valid here
-     *  (libtorrent hands it to us); we must NOT call isValid() on handles we
-     *  cached ourselves, because after session.remove() the native object is
-     *  freed and isValid() dereferences it -> SIGSEGV. */
-    private fun safeHandle(a: Alert<*>): TorrentHandle? =
-        try {
-            (a as? org.libtorrent4j.alerts.TorrentAlert<*>)?.handle()
-        } catch (_: Exception) {
-            null
-        }
-
-    private fun boardByHandle(h: TorrentHandle): Board? =
-        boardMap.values.firstOrNull {
-            try { it.handle != null && it.handle!!.infoHash() == h.infoHash() }
-            catch (_: Exception) { false }
-        }
-
-    private fun onTorrentAdded(a: AddTorrentAlert) {
-        // A failed add (invalid magnet, duplicate, …) carries an error and an
-        // INVALID handle — touching it throws on libtorrent's thread.
-        val err = a.error()
-        if (err != null && err.isError) {
-            log("add torrent failed: ${err.message}")
-            return
-        }
-        val h = safeHandle(a) ?: return
-        // Post (don't block) to the lt thread: this listener runs on
-        // libtorrent's internal thread, and blocking it deadlocks against
-        // session.* calls executing on the lt thread.
-        postLt {
-            val ih = try { h.infoHash().toHex() } catch (_: Throwable) { return@postLt }
-            // Match by infohash — with concurrent adds (restore + join +
-            // publish) "first board with a null handle" can wire a torrent to
-            // the WRONG board, breaking peer counts, progress and removal.
-            val b = boardMap.values.firstOrNull { it.handle == null && it.infoHash.equals(ih, true) }
-                ?: boardMap.values.firstOrNull { it.handle == null }
-                ?: return@postLt
-            b.handle = h
-            b.infoHash = ih
-            scanFiles(b)
-            publishBoards()
+            } catch (_: Throwable) {}
         }
     }
 
@@ -258,17 +241,16 @@ class BitBoardEngine(val context: Context) {
     /* persistence                                                         */
     /* ------------------------------------------------------------------ */
 
-    private fun loadState(): MutableMap<String, Pair<String, Long>> {
-        val out = LinkedHashMap<String, Pair<String, Long>>()
+    /** name -> createdAt from state.json (same format as the desktop app). */
+    private fun loadState(): Map<String, Long> {
+        val out = LinkedHashMap<String, Long>()
         try {
-            val json = stateFile.readText()
-            // Minimal JSON parse of {boards:{Name:{name,infoHash,createdAt}}}
-            val boardsObj = json.substringAfter("\"boards\"", "").substringAfter("{", "")
-            if (boardsObj.isNotEmpty()) {
-                val re = Regex("\"name\"\\s*:\\s*\"([^\"]+)\"[^}]*?\"infoHash\"\\s*:\\s*\"([^\"]+)\"[^}]*?\"createdAt\"\\s*:\\s*(\\d+)")
-                for (m in re.findAll(boardsObj)) {
-                    out[m.groupValues[1]] = Pair(m.groupValues[2], m.groupValues[3].toLongOrNull() ?: 0L)
-                }
+            val boardsObj = JSONObject(stateFile.readText()).optJSONObject("boards") ?: return out
+            val keys = boardsObj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                val b = boardsObj.optJSONObject(key) ?: continue
+                out[b.optString("name", key)] = b.optLong("createdAt", System.currentTimeMillis())
             }
         } catch (_: Exception) {}
         return out
@@ -276,19 +258,17 @@ class BitBoardEngine(val context: Context) {
 
     private fun saveState() {
         try {
-            val sb = StringBuilder("{\n  \"boards\": {\n")
-            val entries = boardMap.entries.toList()
-            entries.forEachIndexed { i, entry ->
-                val name = entry.key
-                val b = entry.value
-                sb.append("    \"").append(name.replace("\"", "\\\"")).append("\": {\n")
-                sb.append("      \"name\": \"").append(name.replace("\"", "\\\"")).append("\",\n")
-                sb.append("      \"infoHash\": \"").append(b.infoHash).append("\",\n")
-                sb.append("      \"createdAt\": ").append(b.createdAt).append("\n")
-                sb.append("    }").append(if (i < entries.size - 1) "," else "").append("\n")
+            val boardsObj = JSONObject()
+            for (b in boardMap.values.sortedBy { it.createdAt }) {
+                boardsObj.put(
+                    b.name,
+                    JSONObject()
+                        .put("name", b.name)
+                        .put("infoHash", b.infoHash)
+                        .put("createdAt", b.createdAt)
+                )
             }
-            sb.append("  }\n}")
-            stateFile.writeText(sb.toString())
+            stateFile.writeText(JSONObject().put("boards", boardsObj).toString(2))
         } catch (_: Exception) {}
     }
 
@@ -296,22 +276,9 @@ class BitBoardEngine(val context: Context) {
         val saved = loadState()
         if (saved.isEmpty()) return@withContext
         log("restoring ${saved.size} saved board(s)…")
-        for ((name, pair) in saved) {
-            if (boardMap.containsKey(name)) continue
-            val dir = boardDir(name)
-            dir.mkdirs()
-            val board = Board(name, dir, pair.first, createdAt = pair.second)
-            boardMap[name] = board
-            scanFiles(board)
-            publishBoards()
+        for ((name, createdAt) in saved) {
             try {
-                if (dir.listFiles()?.isNotEmpty() == true) {
-                    publishBoard(board)
-                    log("restored board \"$name\" — seeding")
-                } else {
-                    // Fresh join from the swarm; keep the entry listed.
-                    joinSwarm(board)
-                }
+                ensureBoard(name, "restored", createdAt)
             } catch (e: Exception) {
                 log("could not fully restore \"$name\": ${e.message}")
             }
@@ -326,34 +293,62 @@ class BitBoardEngine(val context: Context) {
     fun boardDir(name: String): File =
         File(boardsDir, Protocol.boardDirName(name))
 
-    suspend fun createBoard(name: String): BoardSnapshot = withContext(Dispatchers.IO) {
+    /**
+     * Create OR join a board — the same operation: make the folder, seed it,
+     * and let LAN beacons bring in whatever peers already have.
+     */
+    private suspend fun ensureBoard(name: String, verb: String, createdAt: Long? = null): Board {
         val n = name.trim()
         require(n.isNotEmpty()) { "Board name required" }
-        boardMap[n]?.let { return@withContext snapshot(it) }
 
-        val dir = boardDir(n)
-        dir.mkdirs()
-        val board = Board(n, dir, Protocol.boardInfoHash(n))
-        boardMap[n] = board
+        var created = false
+        val board = ensureMutex.withLock {
+            val existing = boardMap[n]
+            if (existing != null) {
+                existing
+            } else {
+                val dir = boardDir(n).apply { mkdirs() }
+                val b = Board(n, dir, createdAt ?: System.currentTimeMillis())
+                boardMap[n] = b
+                created = true
+                b
+            }
+        }
+        if (!created) return board
+
+        scanFiles(board)
         publishBoards() // show in UI right away
-
         try {
-            publishBoard(board)
+            publishLocked(board)
         } catch (e: Exception) {
             boardMap.remove(n)
             publishBoards()
-            log("failed to create board \"$n\": ${e.message}")
+            log("failed to $verb board \"$n\": ${e.message}")
             throw e
         }
         saveState()
         publishBoards()
-        log("board \"$n\" created (${board.infoHash.take(12)}…)")
-        snapshot(board)
+        discoveredMap.remove(n)   // no longer just "discovered" — we have it
+        _discovered.value = discoveredMap.keys.toList()
+        log("board \"$n\" $verb (${board.infoHash.take(12)}…)")
+        return board
     }
 
+    suspend fun createBoard(name: String): BoardSnapshot = withContext(Dispatchers.IO) {
+        snapshot(ensureBoard(name, "created"))
+    }
+
+    suspend fun joinBoard(name: String): BoardSnapshot = withContext(Dispatchers.IO) {
+        snapshot(ensureBoard(name, "joined"))
+    }
+
+    /** Serialise (re)publishing per board. */
+    private suspend fun publishLocked(board: Board) =
+        board.publishLock.withLock { publishBoard(board) }
+
     /**
-     * Publish (or re-publish) the board torrent from the local folder.
-     * Rebuilt whenever files change so peers receive updates.
+     * Publish (or re-publish) OUR torrent from the local folder. Rebuilt
+     * whenever files change so peers can see the update.
      */
     private suspend fun publishBoard(board: Board) = withContext(Dispatchers.IO) {
         val entries = board.dir.listFiles()
@@ -365,43 +360,52 @@ class BitBoardEngine(val context: Context) {
         File(board.dir, Protocol.LEGACY_MANIFEST_NAME).delete()
 
         // Visible manifest guarantees the torrent always has >= 1 file.
-        val manifest = buildString {
-            append("{\n  \"board\": \"").append(board.name.replace("\"", "\\\"")).append("\",\n")
-            append("  \"createdAt\": ").append(board.createdAt).append(",\n")
-            append("  \"files\": [\n")
-            entries.forEachIndexed { i, f ->
-                append("    { \"name\": \"").append(f.name.replace("\"", "\\\""))
-                append("\", \"size\": ").append(f.length())
-                append(", \"mtime\": ").append(f.lastModified()).append(" }")
-                append(if (i < entries.size - 1) "," else "").append("\n")
-            }
-            append("  ]\n}")
+        val filesJson = JSONArray()
+        for (f in entries) {
+            filesJson.put(
+                JSONObject().put("name", f.name).put("size", f.length()).put("mtime", f.lastModified())
+            )
         }
+        val manifest = JSONObject()
+            .put("board", board.name)
+            .put("createdAt", board.createdAt)
+            .put("files", filesJson)
+            .toString(2)
         File(board.dir, Protocol.MANIFEST_NAME).writeText(manifest)
 
-        // All native session/handle access is serialized on the libtorrent
-        // thread (see onLt) to avoid use-after-free races.
+        // v1-ONLY torrent. libtorrent defaults to a v1+v2 hybrid, which adds
+        // pad files and v2 keys; WebTorrent (desktop) only speaks v1 and can
+        // choke on them.
         val builder = TorrentBuilder()
             .path(board.dir)
             .creator("BitBoard Android 1.0")
+            .flags(TorrentBuilder.V1_ONLY)
         Protocol.TRACKERS.forEach { builder.addTracker(it) }
         val result = builder.generate()
+        val bytes = result.entry().bencode()
 
-        val ti = TorrentInfo.bdecode(result.entry().bencode())
-        board.infoHash = ti.infoHash().toHex()
+        val ti = TorrentInfo.bdecode(bytes)
+        val newHash = ti.infoHash().toHex()
 
-        val magnet = Protocol.magnetUri(board.name, board.infoHash)
         val added = onLt {
             try {
-                // Null before remove: session.remove() frees the native
-                // object; nothing may touch the old handle afterwards.
                 val old = board.handle
-                board.handle = null
-                if (old != null) {
-                    try { session.remove(old) } catch (_: Throwable) {}
+                val oldHash = board.infoHash
+                if (old != null && oldHash.equals(newHash, true)) {
+                    true // identical torrent already seeding
+                } else {
+                    // Null before remove: session.remove() frees the native
+                    // object; nothing may touch the old handle afterwards.
+                    board.handle = null
+                    if (old != null) {
+                        try { session.remove(old) } catch (_: Throwable) {}
+                    }
+                    // Save path = PARENT of the board folder: libtorrent
+                    // lays files out as <save_path>/<torrent name>/<files>
+                    // and the torrent name is the folder's basename.
+                    session.download(ti, boardsDir)
+                    true
                 }
-                session.download(ti, board.dir)
-                true
             } catch (e: Throwable) {
                 log("failed to seed \"${board.name}\": ${e.message}")
                 false
@@ -411,60 +415,25 @@ class BitBoardEngine(val context: Context) {
             publishBoards()
             return@withContext
         }
+        board.infoHash = newHash
+        board.seen.add(newHash)
 
-        // Save the .torrent for debugging / manual sharing.
-        try {
-            File(torrentsDir, "${board.infoHash}.torrent").writeBytes(result.entry().bencode())
-        } catch (_: Exception) {}
+        try { File(torrentsDir, "$newHash.torrent").writeBytes(bytes) } catch (_: Exception) {}
 
-        // The AddTorrentAlert listener wires the handle; wait briefly for it.
-        val deadline = System.currentTimeMillis() + 10_000
-        while (board.handle == null && System.currentTimeMillis() < deadline) {
-            kotlinx.coroutines.delay(100)
-        }
-        board.handle?.let { _ ->
-            scanFiles(board)
-            log("published \"${board.name}\" — magnet: $magnet")
-        }
-        publishBoards()
-    }
-
-    /**
-     * Join a board by name. The desktop beacon carries the real content-derived
-     * infohash; when we have it we join that swarm directly. Otherwise we fall
-     * back to the deterministic hash (works when the creator's torrent was
-     * built with the same deterministic scheme).
-     */
-    suspend fun joinBoard(name: String, knownInfoHash: String? = null): BoardSnapshot =
-        withContext(Dispatchers.IO) {
-            val n = name.trim()
-            require(n.isNotEmpty()) { "Board name required" }
-            boardMap[n]?.let { return@withContext snapshot(it) }
-
-            val dir = boardDir(n)
-            dir.mkdirs()
-            val board = Board(n, dir, knownInfoHash ?: Protocol.boardInfoHash(n))
-            boardMap[n] = board
-            publishBoards()
-
-            joinSwarm(board)
-            saveState()
-            publishBoards()
-            log("joined board \"$n\"")
-            snapshot(board)
-        }
-
-    private suspend fun joinSwarm(board: Board) = withContext(Dispatchers.IO) {
-        val magnet = Protocol.magnetUri(board.name, board.infoHash)
-        onLt {
-            try {
-                session.download(magnet, board.dir, null)
-                log("joining \"${board.name}\" — searching swarm…")
-            } catch (e: Throwable) {
-                // Keep the board listed as "searching for peers" rather than
-                // crashing; the next beacon / restart will retry.
-                log("could not join \"${board.name}\" yet: ${e.message}")
+        // session.download() is asynchronous: look the handle up by infohash.
+        if (board.handle == null) {
+            val sha = ti.infoHash()
+            val deadline = System.currentTimeMillis() + 10_000
+            while (board.handle == null && System.currentTimeMillis() < deadline) {
+                val h = onLt { try { session.find(sha) } catch (_: Throwable) { null } }
+                if (h != null) board.handle = h else delay(100)
             }
+        }
+        scanFiles(board)
+        if (board.handle != null) {
+            log("published \"${board.name}\" (${newHash.take(12)}…)")
+        } else {
+            log("\"${board.name}\" was added but is not seeding yet")
         }
         publishBoards()
     }
@@ -477,7 +446,7 @@ class BitBoardEngine(val context: Context) {
         val dest = File(board.dir, base)
         src.copyTo(dest, overwrite = true)
         scanFiles(board)
-        publishBoard(board)
+        publishLocked(board)
         saveState()
         publishBoards()
         log("added $base to \"$boardName\" — replicating to peers")
@@ -488,15 +457,8 @@ class BitBoardEngine(val context: Context) {
         try {
             val entries = board.dir.listFiles()
                 ?.filter { it.isFile && Protocol.isImageFile(it.name) }
-                ?.sortedBy { it.name.lowercase() }
                 ?: return
             val seen = HashSet<String>()
-            // Read status() on the libtorrent thread so it can never race a
-            // concurrent session.remove() that frees the native handle.
-            val progress = onLt {
-                try { board.handle?.status()?.progress() ?: 1f }
-                catch (_: Throwable) { 1f }
-            }
             for (f in entries) {
                 seen.add(f.name)
                 val existing = board.files[f.name]
@@ -505,7 +467,7 @@ class BitBoardEngine(val context: Context) {
                         name = f.name,
                         size = f.length(),
                         downloadedAt = f.lastModified(),
-                        progress = progress
+                        progress = 1f
                     )
                 }
             }
@@ -514,101 +476,257 @@ class BitBoardEngine(val context: Context) {
     }
 
     /* ------------------------------------------------------------------ */
+    /* merging a peer's board                                              */
+    /* ------------------------------------------------------------------ */
+
+    /** Boards announced by a LAN peer (beacon handler; runs on the UDP thread). */
+    fun onLanBoards(peerBoards: List<Pair<String, String>>, addr: String, port: Int, fromPeerId: String) {
+        val now = System.currentTimeMillis()
+        // Expire discovered boards whose beacons stopped arriving.
+        discoveredMap.entries.removeIf { now - it.value > Protocol.DISCOVERED_TTL_MS }
+        for ((name, hash) in peerBoards) {
+            if (!boardMap.containsKey(name) && discoveredMap.put(name, now) == null) {
+                _discovered.value = discoveredMap.keys.toList()
+            }
+            handlePeerBoard(name, hash.lowercase(), addr, port, fromPeerId)
+        }
+    }
+
+    /** Boards seen on the LAN that this device has NOT joined. */
+    fun discoveredBoards(): List<String> = discoveredMap.keys.toList()
+
+    private fun handlePeerBoard(name: String, hash: String, addr: String, port: Int, fromPeerId: String) {
+        val board = boardMap[name]
+        if (board == null) {
+            // Board we don't have: it is already in the discovered list (the
+            // beacon handler adds it). NEVER auto-join — a board only lands
+            // on this device when the user asks for it.
+            return
+        }
+        if (fromPeerId.isNotEmpty()) board.lanPeers[fromPeerId] = System.currentTimeMillis()
+
+        // Same torrent already: just make sure we are directly connected.
+        if (hash.equals(board.infoHash, true)) {
+            connectDirect(board, addr, port)
+            return
+        }
+        if (board.seen.contains(hash)) return
+        if ((board.retryAt[hash] ?: 0L) > System.currentTimeMillis()) return
+        if (!board.merging.add(hash)) return // already being fetched
+
+        scope.launch {
+            try {
+                mergeFromPeer(board, hash, addr, port)
+            } catch (e: Exception) {
+                board.retryAt[hash] = System.currentTimeMillis() + Protocol.RETRY_COOLDOWN_MS
+                log("sync of \"${board.name}\" from $addr failed: ${e.message}")
+            } finally {
+                board.merging.remove(hash)
+                board.mergeProgress = 1f
+                publishBoards()
+            }
+        }
+    }
+
+    /** Connect our seeding torrent straight to a LAN peer (no tracker/DHT). */
+    private fun connectDirect(board: Board, addr: String, port: Int) {
+        if (port <= 0) return
+        postLt {
+            val h = board.handle ?: return@postLt
+            h.swig().connect_peer(TcpEndpoint(addr, port).swig())
+        }
+    }
+
+    private suspend fun mergeFromPeer(board: Board, hash: String, addr: String, port: Int) =
+        withContext(Dispatchers.IO) {
+            val stageRoot = File(stagingDir, hash)
+            var h: TorrentHandle? = null
+            try {
+                stageRoot.deleteRecursively()
+                stageRoot.mkdirs()
+                board.mergeProgress = 0f
+                publishBoards()
+                log("syncing \"${board.name}\" from $addr…")
+
+                onLt { session.download(Protocol.magnetUri(board.name, hash), stageRoot, torrent_flags_t()) }
+
+                // 1. find the handle of the staging torrent
+                val sha = Sha1Hash.parseHex(hash)
+                val t0 = System.currentTimeMillis()
+                var found: TorrentHandle? = null
+                while (found == null) {
+                    found = onLt { try { session.find(sha) } catch (_: Throwable) { null } }
+                    if (found == null) {
+                        if (System.currentTimeMillis() - t0 > 10_000) throw IOException("could not start the transfer")
+                        delay(100)
+                    }
+                }
+                val handle: TorrentHandle = found ?: throw IOException("could not start the transfer")
+                h = handle
+
+                // 2. connect directly, wait for metadata, choose the missing files
+                var wanted: List<String>? = null
+                var lastConnect = 0L
+                var lastDone = -1L
+                var lastMove = System.currentTimeMillis()
+                while (true) {
+                    val now = System.currentTimeMillis()
+                    val st = onLt { handle.status() }
+
+                    if (wanted == null) {
+                        if (st.hasMetadata()) {
+                            wanted = onLt { selectMissing(board, handle) }
+                            lastMove = now
+                            if (wanted.isEmpty()) break // we already have everything
+                        } else if (now - t0 > Protocol.METADATA_TIMEOUT_MS) {
+                            throw IOException("timed out fetching torrent metadata")
+                        }
+                    } else {
+                        val total = st.totalWanted()
+                        val done = st.totalWantedDone()
+                        board.mergeProgress = if (total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else 0f
+                        if (st.isFinished()) break
+                        if (done > lastDone) { lastDone = done; lastMove = now }
+                        else if (now - lastMove > Protocol.STALL_TIMEOUT_MS) throw IOException("transfer stalled")
+                    }
+
+                    // (Re)connect to the LAN peer; harmless if already connected.
+                    if (port > 0 && st.numPeers() == 0 && now - lastConnect > 4000) {
+                        lastConnect = now
+                        onLt {
+                            try { handle.swig().connect_peer(TcpEndpoint(addr, port).swig()) }
+                            catch (_: Throwable) {}
+                        }
+                    }
+                    delay(500)
+                }
+
+                // 3. merge into our folder and republish
+                val staged = (wanted ?: emptyList()).map { rel -> File(stageRoot, rel) }
+                onLt { try { session.remove(handle) } catch (_: Throwable) {} }
+                h = null
+                val added = importStaged(board, staged)
+                board.seen.add(hash)
+                if (added > 0) {
+                    scanFiles(board)
+                    publishLocked(board) // new content => new hash of our own
+                    saveState()
+                    log("board \"${board.name}\": received $added new image(s)")
+                }
+            } finally {
+                val leftover = h
+                if (leftover != null) {
+                    onLt { try { session.remove(leftover) } catch (_: Throwable) {} }
+                }
+                stageRoot.deleteRecursively()
+            }
+        }
+
+    /**
+     * Runs on the lt thread. Ignores every file we don't need (already have it
+     * with the same size, not a flat image file, manifest, pad files, …) and
+     * returns the torrent-relative paths of the ones we do want.
+     */
+    private fun selectMissing(board: Board, h: TorrentHandle): List<String> {
+        val ti = h.torrentFile() ?: return emptyList()
+        val fs = ti.files()
+        val wanted = ArrayList<String>()
+        for (i in 0 until fs.numFiles()) {
+            val rel = fs.filePath(i)
+            val parts = rel.split('/')                     // [<torrent name>, <file>]
+            var need = parts.size == 2 && Protocol.isImageFile(parts[1])
+            if (need) {
+                val local = File(board.dir, parts[1])
+                if (local.isFile && local.length() == fs.fileSize(i)) need = false
+            }
+            if (need) wanted.add(rel) else h.filePriority(i, Priority.IGNORE)
+        }
+        return wanted
+    }
+
+    /** Copy staged images into the board folder; returns how many were new. */
+    private fun importStaged(board: Board, staged: List<File>): Int {
+        var added = 0
+        for (f in staged) {
+            if (!f.isFile) continue
+            val data = try { f.readBytes() } catch (_: Exception) { continue }
+            val digest = Protocol.sha1Hex(data)
+
+            // Already have these exact bytes (under any name)? Nothing to do.
+            val local = board.dir.listFiles()?.filter { it.isFile && Protocol.isImageFile(it.name) } ?: emptyList()
+            val dup = local.any { l ->
+                l.length() == data.size.toLong() &&
+                    try { Protocol.sha1Hex(l.readBytes()) == digest } catch (_: Exception) { false }
+            }
+            if (dup) continue
+
+            var name = f.name
+            var dest = File(board.dir, name)
+            if (dest.exists()) {
+                // Same name, different content: keep BOTH. The suffix comes from
+                // the content hash so every device names the copy identically.
+                val dot = name.lastIndexOf('.')
+                val stem = if (dot > 0) name.substring(0, dot) else name
+                val ext = if (dot > 0) name.substring(dot) else ""
+                name = "$stem-${digest.take(6)}$ext"
+                dest = File(board.dir, name)
+                if (dest.exists()) continue
+            }
+            try {
+                dest.writeBytes(data)
+                added++
+            } catch (e: Exception) {
+                log("could not save $name: ${e.message}")
+            }
+        }
+        return added
+    }
+
+    /* ------------------------------------------------------------------ */
     /* reporting                                                           */
     /* ------------------------------------------------------------------ */
 
     private fun snapshot(b: Board): BoardSnapshot {
         scanFiles(b)
-        val files = b.files.values
-            .sortedByDescending { it.downloadedAt }
-            .toList()
-        // Read peers/progress on the libtorrent thread (see scanFiles).
-        val (peers, progress) = onLt {
-            try {
-                val st = b.handle?.status()
-                (st?.numPeers() ?: 0) to (st?.progress() ?: 1f)
-            } catch (_: Throwable) {
-                0 to 1f
-            }
+        val files = b.files.values.sortedByDescending { it.downloadedAt }
+        val now = System.currentTimeMillis()
+        b.lanPeers.entries.removeIf { now - it.value > Protocol.LAN_PEER_TTL_MS }
+        val lan = b.lanPeers.size
+        // Read peers on the libtorrent thread (see onLt).
+        val connected = onLt {
+            try { b.handle?.status()?.numPeers() ?: 0 } catch (_: Throwable) { 0 }
         }
+        val syncing = b.merging.isNotEmpty()
         return BoardSnapshot(
             name = b.name,
             infoHash = b.infoHash,
             fileCount = files.size,
             totalBytes = files.sumOf { it.size },
-            peers = peers,
-            progress = progress,
-            files = files
+            // Peers we are connected to, or LAN devices that announced this
+            // board in the last few seconds — whichever is larger.
+            peers = maxOf(connected, lan),
+            progress = if (syncing) b.mergeProgress else 1f,
+            files = files,
+            syncing = syncing
         )
     }
 
     fun publishBoards() {
-        _boards.value = boardMap.values.map { snapshot(it) }
+        _boards.value = boardMap.values.sortedBy { it.createdAt }.map { snapshot(it) }
     }
 
     fun log(line: String) {
-        val stamped = line
-        _logs.value = (_logs.value + stamped).takeLast(200)
+        _logs.update { (it + line).takeLast(200) }
         android.util.Log.d("BitBoard", line)
     }
 
-    /** Boards announced by a LAN peer that we don't have yet. */
-    fun onLanBoards(peerBoards: List<Pair<String, String>>) {
-        val missing = peerBoards.filter { (name, _) -> !boardMap.containsKey(name) }
-        if (missing.isNotEmpty()) {
-            _discovered.value = (_discovered.value + missing.map { it.first }).distinct()
-            for ((name, infoHash) in missing) {
-                log("discovered board \"$name\" on LAN — joining")
-                scope.launch {
-                    try { joinBoard(name, infoHash) } catch (_: Exception) {}
-                }
-            }
-        }
-        // Boards we already have may have been re-published under a NEW
-        // content-derived infohash — follow the peer to the new swarm.
-        for ((name, infoHash) in peerBoards) {
-            if (boardMap.containsKey(name)) {
-                scope.launch { followInfoHashUpdate(name, infoHash) }
-            }
-        }
-    }
-
-    /**
-     * A LAN peer announced a board we already have, but with a DIFFERENT
-     * infohash — the board was re-published (files added/removed) and the
-     * swarm moved. Leave our stale swarm and join the new one so the two
-     * devices converge again instead of seeding disjoint swarms forever.
-     */
-    private suspend fun followInfoHashUpdate(name: String, newInfoHash: String) =
-        withContext(Dispatchers.IO) {
-            if (newInfoHash.isEmpty()) return@withContext
-            val board = boardMap[name] ?: return@withContext
-            if (board.infoHash.equals(newInfoHash, true)) return@withContext
-            if (board.migrating) return@withContext
-            board.migrating = true
-            log("board \"$name\" updated on a peer — switching to the new swarm")
-            try {
-                onLt {
-                    // Null before remove (see publishBoard): never leave a
-                    // freed native handle reachable from the board.
-                    val old = board.handle
-                    board.handle = null
-                    if (old != null) {
-                        try { session.remove(old) } catch (_: Throwable) {}
-                    }
-                    board.infoHash = newInfoHash
-                }
-                saveState()
-                publishBoards()
-                joinSwarm(board)
-            } finally {
-                board.migrating = false
-            }
-        }
-
-    /** Our beacon payload board list: name -> infoHash. */
+    /** Our beacon payload: only boards that are actually seeding (announcing a
+     *  hash nobody can fetch just makes peers time out). */
     fun beaconBoards(): List<Pair<String, String>> =
-        boardMap.values.map { it.name to it.infoHash }
+        boardMap.values
+            .filter { it.handle != null }
+            .sortedBy { it.createdAt }
+            .map { it.name to it.infoHash }
 
     /** Image files currently present in a board's folder (for the gallery). */
     fun boardFiles(name: String): List<File> {

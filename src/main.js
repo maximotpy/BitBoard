@@ -29,21 +29,27 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
-  engine = new BitBoardEngine();
-  await engine.ready();
+  // Create the window FIRST so the app is visibly alive even if engine
+  // startup is slow or fails — a rejected promise here used to leave the
+  // process running with no window at all (looked like "app won't start").
+  createWindow();
 
-  engine.on('log', (line) => {
-    if (win && !win.isDestroyed()) win.webContents.send('bb:log', line);
+  // Register ALL IPC handlers synchronously, before any engine await: the
+  // renderer starts calling bb:getBoards as soon as the page loads, and a
+  // handler registered too late makes the UI throw "No handler registered".
+  ipcMain.handle('bb:getBoards', async () => {
+    if (!engine) return [];
+    await engine.ready();
+    return engine.getBoardsSnapshot();
   });
-  engine.on('boards-changed', (snapshot) => {
-    if (win && !win.isDestroyed()) win.webContents.send('bb:boards', snapshot);
+  ipcMain.handle('bb:getDiscovered', async () => {
+    if (!engine) return [];
+    await engine.ready();
+    return engine.getDiscoveredSnapshot();
   });
-
-  engine.startDiscovery();
-
-  ipcMain.handle('bb:getBoards', async () => { await engine.ready(); return engine.getBoardsSnapshot(); });
   ipcMain.handle('bb:getThumbnail', (_e, boardName, fileName) => {
     try {
+      if (!engine) return null;
       const board = engine.boards.get(boardName);
       if (!board) return null;
       const p = path.join(board.dir, path.basename(fileName)); // basename: no traversal
@@ -56,8 +62,8 @@ app.whenReady().then(async () => {
   // The raw board objects hold a Map and a live WebTorrent instance, which
   // are not structured-cloneable, so they must never cross IPC. Return a
   // plain serializable ack instead; the UI updates via the 'bb:boards' push.
-  ipcMain.handle('bb:createBoard', async (_e, name) => { await engine.createBoard(name); return { ok: true }; });
-  ipcMain.handle('bb:joinBoard', async (_e, name) => { await engine.joinBoard(name); return { ok: true }; });
+  ipcMain.handle('bb:createBoard', async (_e, name) => { await engine.ready(); await engine.createBoard(name); return { ok: true }; });
+  ipcMain.handle('bb:joinBoard', async (_e, name) => { await engine.ready(); await engine.joinBoard(name); return { ok: true }; });
   ipcMain.handle('bb:addImage', async (_e, boardName) => {
     await engine.ready();
     const res = await dialog.showOpenDialog(win, {
@@ -72,7 +78,27 @@ app.whenReady().then(async () => {
     return true;
   });
 
-  createWindow();
+  try {
+    engine = new BitBoardEngine();
+    engine.on('log', (line) => {
+      if (win && !win.isDestroyed()) win.webContents.send('bb:log', line);
+    });
+    engine.on('boards-changed', (snapshot) => {
+      if (win && !win.isDestroyed()) win.webContents.send('bb:boards', snapshot);
+    });
+    engine.on('discovered-changed', (names) => {
+      if (win && !win.isDestroyed()) win.webContents.send('bb:discovered', names);
+    });
+    // Start LAN discovery immediately: restoring saved boards can take a while
+    // and beacons must not wait for it (merges are deferred until ready).
+    engine.startDiscovery();
+    await engine.ready();
+  } catch (err) {
+    console.error('[main] engine startup failed:', err);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('bb:log', 'engine startup failed: ' + err.message);
+    }
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

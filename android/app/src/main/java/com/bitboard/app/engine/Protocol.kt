@@ -12,9 +12,15 @@ import java.security.MessageDigest
  *  - Manifest: "bitboard-manifest.json" (visible, NOT dot-prefixed —
  *    create-torrent silently drops hidden files) with shape
  *    { board, createdAt, files: [{name, size, mtime}] }.
- *  - Torrent name: "bitboard-<boardName>".
- *  - LAN beacon: JSON {app:"bitboard", peerId, host, boards:[{name, infoHash}]}
- *    on UDP multicast 239.255.66.66:45666 every 3 s.
+ *  - Torrent name: the board folder's basename (libtorrent/WebTorrent both
+ *    derive it from the folder).
+ *  - LAN beacon: JSON {app:"bitboard", v:2, peerId, host, port, reply,
+ *    boards:[{name, infoHash}]} on UDP multicast + subnet broadcast
+ *    239.255.66.66:45666 every 3 s. `port` is the sender's BitTorrent TCP
+ *    port so receivers can connect directly without trackers/DHT.
+ *  - Infohashes are NOT shared between devices (they cover mtimes, creation
+ *    date, …). Devices instead MERGE: fetch the peer's torrent, copy the
+ *    images they lack, republish their own folder.
  */
 object Protocol {
     const val MULTICAST_ADDR = "239.255.66.66"
@@ -24,6 +30,15 @@ object Protocol {
     const val LEGACY_MANIFEST_NAME = ".bitboard-manifest.json"
     const val TORRENT_PREFIX = "bitboard-"
     const val HASH_PREFIX = "bitboard-board-v1:"
+
+    const val METADATA_TIMEOUT_MS = 45_000L   // give up fetching a peer's torrent metadata
+    const val STALL_TIMEOUT_MS = 90_000L      // give up when a transfer makes no progress
+    const val RETRY_COOLDOWN_MS = 20_000L     // don't hammer a peer whose fetch just failed
+    const val LAN_PEER_TTL_MS = 10_000L       // a LAN peer counts as present for this long
+    const val DISCOVERED_TTL_MS = 30_000L     // a discovered (not joined) board stays offered this long
+
+    private val HEX40 = Regex("^[0-9a-fA-F]{40}$")
+    fun isInfoHash(s: String): Boolean = HEX40.matches(s)
 
     val TRACKERS = listOf(
         "udp://tracker.opentrackr.org:1337/announce",
@@ -38,8 +53,10 @@ object Protocol {
     fun isImageFile(name: String): Boolean =
         name.substringAfterLast('.', "").lowercase() in IMAGE_EXT
 
-    fun sha1Hex(s: String): String {
-        val d = MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8))
+    fun sha1Hex(s: String): String = sha1Hex(s.toByteArray(Charsets.UTF_8))
+
+    fun sha1Hex(bytes: ByteArray): String {
+        val d = MessageDigest.getInstance("SHA-1").digest(bytes)
         return d.joinToString("") { "%02x".format(it) }
     }
 
