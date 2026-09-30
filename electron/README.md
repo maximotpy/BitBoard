@@ -1,17 +1,11 @@
 # BitBoard
 
-P2P image replication between devices — a monorepo containing two clients
-that share the same protocol and sync model:
-
-| Folder   | Client            | Stack                          |
-|----------|-------------------|--------------------------------|
-| `electron/` | Desktop app    | Electron + Node (WebTorrent)   |
-| `android/`  | Mobile app     | Kotlin + Android (jlibtorrent) |
+P2P image replication between devices
 
 Every **board** is a named folder of images. Each device running BitBoard that
-joins a board both **seeds and downloads** it over the **BitTorrent protocol**,
-so images replicate automatically to every device that has the same board —
-like a cloud folder, but fully peer-to-peer.
+joins a board both **seeds and downloads** it over the **BitTorrent protocol**
+(via WebTorrent: DHT + trackers + WebRTC peers), so images replicate
+automatically to every device that has the same board.
 
 ## How it works
 
@@ -32,39 +26,23 @@ Device A                 Device B
 - **Cross-network**: peers also find each other through public WebTorrent
   trackers and the DHT, so sync works over the internet too.
 
-## Running the desktop app (Electron)
+## Run
 
 ```
-npm install        # from the repo root (installs electron/ deps)
-npm start
-```
-
-Or directly:
-
-```
-cd electron
 npm install
 npm start
 ```
 
-## Building the Android app
+## Usage
 
-```
-cd android
-.\gradlew.bat assembleDebug
-```
-
-See `android/README.md` for details.
-
-## Usage (both clients)
-
-1. **New board** → give it a name (e.g. `Vacation`).
-2. **Add image** → it is copied into the board folder and published to the swarm.
+1. **New board** in the sidebar → give it a name (e.g. `Vacation`).
+2. **Add image** → pick an image; it is copied into the board folder and
+   published to the swarm.
 3. On another device, either wait for the LAN beacon to auto-join the board,
    or use **Join board** and type the exact same name.
-4. Boards list their images **by download date** (newest first).
+4. The main area lists the board's images **by download date** (newest first).
 
-## Data location (desktop)
+## Data location
 
 `data/boards/<hash>/` — board folders (images live here, safe to back up).
 `data/torrents/` — generated `.torrent` files.

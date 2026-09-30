@@ -1,32 +1,14 @@
 {
-  "name": "bitboard",
+  "name": "bitboard-monorepo",
   "version": "1.0.0",
-  "description": "P2P image board replication between devices (BitTorrent-based, cloud-like sync without a cloud).",
-  "main": "src/main.js",
-  "author": "BitBoard",
+  "private": true,
+  "description": "BitBoard monorepo: Electron desktop app and Android app sharing the same P2P torrent engine.",
   "license": "MIT",
   "scripts": {
-    "start": "electron .",
-    "dev": "electron . --dev"
-  },
-  "devDependencies": {
-    "electron": "^31.7.7"
-  },
-  "dependencies": {
-    "create-torrent": "^6.0.15",
-    "parse-torrent": "^11.0.17",
-    "webtorrent": "^2.2.1",
-    "uint8-util": "2.2.6"
-  },
-  "allowScripts": {
-    "electron@31.7.7": true,
-    "bufferutil@4.1.0": true,
-    "utf-8-validate@6.0.6": true,
-    "node-datachannel@0.32.3": true,
-    "utp-native@2.5.3": true,
-    "ip-set@3.0.0": true
-  },
-  "overrides": {
-    "uint8-util": "2.2.6"
+    "start": "npm run start --prefix electron",
+    "dev": "npm run dev --prefix electron",
+    "install:electron": "npm install --prefix electron",
+    "android": "cd android && .\\gradlew.bat assembleDebug",
+    "android:install": "cd android && .\\gradlew.bat installDebug"
   }
 }

@@ -32,7 +32,7 @@ const dgram = require('dgram');
 
 // BITBOARD_DATA_DIR (or the `dataDir` constructor option) lets tests and
 // multiple instances on one machine use separate data folders.
-const DATA_DIR = process.env.BITBOARD_DATA_DIR || path.join(__dirname, '..', 'data');
+const DATA_DIR = process.env.BITBOARD_DATA_DIR || path.join(__dirname, '..', '..', 'data');
 const BOARDS_DIR = path.join(DATA_DIR, 'boards');
 
 const MULTICAST_ADDR = '239.255.66.66';

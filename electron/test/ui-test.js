@@ -13,12 +13,12 @@ app.whenReady().then(async () => {
   const win = new BrowserWindow({
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, 'src', 'preload.js'),
+      preload: path.join(__dirname, '..', 'src', 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false
     }
   });
-  await win.loadFile(path.join(__dirname, 'src', 'renderer', 'index.html'));
+  await win.loadFile(path.join(__dirname, '..', 'src', 'renderer', 'index.html'));
 
   const results = await win.webContents.executeJavaScript(`
     (async () => {
