@@ -29,8 +29,19 @@ Device A                 Device B
   torrent and peers pick up the new file automatically.
 - **LAN discovery**: a UDP multicast beacon (`239.255.66.66:45666`) announces
   which boards each device has; devices auto-join boards they are missing.
-- **Cross-network**: peers also find each other through public WebTorrent
-  trackers and the DHT, so sync works over the internet too.
+- **Cross-network (internet rendezvous)**: every device seeds its *own* torrent
+  and its infohash differs from every other device's, so trackers/DHT alone can
+  never match two devices. Devices therefore publish "board X = infohash H" to a
+  tiny pub/sub relay (ntfy protocol, `https://ntfy.sh` by default; one topic per
+  board, derived from a hash of the board name). A peer that learns H fetches it
+  through the normal trackers/DHT/PEX and merges the images it lacks. Only
+  infohashes go through the relay: never images, IPs or file names. Desktop:
+  `electron/src/signal.js`; Android: `SignalChannel.kt`. Set
+  `BITBOARD_SIGNAL_URL` (desktop) to use your own ntfy server, or
+  `BITBOARD_SIGNAL=off` to disable it (LAN-only).
+- **NAT caveat**: two phones that are both on mobile data (carrier-grade NAT)
+  usually cannot open a connection to each other at all. At least one side on
+  home Wi-Fi with UPnP/NAT-PMP (or a forwarded TCP port 6881) is normally enough.
 
 ## Running the desktop app (Electron)
 

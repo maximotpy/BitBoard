@@ -26,3 +26,6 @@ android/build/
 # OS noise
 .DS_Store
 Thumbs.db
+
+# --- Patches ---
+bitboard-internet-sync-v2.patch

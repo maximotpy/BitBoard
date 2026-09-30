@@ -29,6 +29,7 @@ async function loadEsmDeps() {
   createTorrent = (await import('create-torrent')).default;
 }
 const dgram = require('dgram');
+const { SignalChannel, signalTopic } = require('./signal');
 
 // BITBOARD_DATA_DIR (or the `dataDir` constructor option) lets tests and
 // multiple instances on one machine use separate data folders.
@@ -48,7 +49,13 @@ const TRACKERS = [
   'wss://tracker.openwebtorrent.com',
   'wss://tracker.webtorrent.dev',
   'udp://tracker.opentrackr.org:1337/announce',
-  'udp://open.tracker.cl:1337/announce'
+  'udp://open.tracker.cl:1337/announce',
+  // Extra public UDP trackers: more chances that two peers on different
+  // networks announce to (and hear about each other from) the same tracker.
+  'udp://open.stealth.si:80/announce',
+  'udp://exodus.desync.com:6969/announce',
+  'udp://tracker.torrent.eu.org:451/announce',
+  'udp://explodie.org:6969/announce'
 ];
 const PUBLISH_TIMEOUT_MS = 30000;
 const METADATA_TIMEOUT_MS = 45000;   // give up fetching a peer's torrent metadata
@@ -56,6 +63,14 @@ const STALL_TIMEOUT_MS = 90000;      // give up when a transfer makes no progres
 const RETRY_COOLDOWN_MS = 20000;     // don't hammer a peer whose fetch just failed
 const LAN_PEER_TTL_MS = 10000;       // a LAN peer counts as present for this long
 const DISCOVERED_TTL_MS = 30000;     // a discovered (not joined) board stays offered this long
+
+// Internet rendezvous (see signal.js)
+const SIGNAL_HEARTBEAT_MS = 10 * 60 * 1000;  // re-announce our infohash this often
+const SIGNAL_TTL_MS = 35 * 60 * 1000;        // a peer's announcement stays actionable this long
+const SIGNAL_TICK_MS = 30 * 1000;            // retry unfinished merges this often
+const SIGNAL_BATCH_MS = 1500;                // collect the relay backlog, then act on the newest per peer
+const SIGNAL_ANNOUNCE_DEBOUNCE_MS = 2000;    // coalesce bursts of re-publishes into one announcement
+const MAX_RETRY_COOLDOWN_MS = 10 * 60 * 1000; // exponential back-off ceiling for a peer that keeps failing
 
 const IMAGE_EXT = new Set([
   '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg', '.avif', '.ico', '.tif', '.tiff'
@@ -156,6 +171,18 @@ class BitBoardEngine extends EventEmitter {
     this._beaconBusy = false;
     this._bound = false;
 
+    // Internet rendezvous: exchange infohashes through a pub/sub relay so
+    // devices on DIFFERENT networks can find each other's torrent.
+    // Disable with { signal: false } or BITBOARD_SIGNAL=off.
+    this.signal = null;
+    if (opts.signal !== false && process.env.BITBOARD_SIGNAL !== 'off') {
+      this.signal = opts.signal || new SignalChannel({
+        baseUrl: opts.signalUrl,
+        log: (m) => this.emit('log', m)
+      });
+    }
+    this._signalTimers = [];
+
     // Async bootstrap: load ESM deps, create the torrent client, then
     // restore the boards saved from the previous run.
     this._ready = (async () => {
@@ -165,6 +192,7 @@ class BitBoardEngine extends EventEmitter {
       this.client = new WebTorrent({ dht: true, lsd: true, utp: false, maxConns: 200 });
       this.client.on('error', (err) => this.emit('log', 'client error: ' + err.message));
       this.client.on('torrent', () => this._emitBoardsChanged());
+      this._startSignalTimers();
       await this._restoreBoards();
     })();
   }
@@ -184,6 +212,12 @@ class BitBoardEngine extends EventEmitter {
       merging: new Set(),            // peer infohashes being fetched right now
       retryAt: new Map(),            // peer infohash -> earliest retry time
       lanPeers: new Map(),           // LAN peerId -> last beacon time
+      signalPeers: new Map(),        // relay peerId -> { hash, at } (internet peers)
+      signalInbox: new Map(),        // relay peerId -> newest raw message, until flushed
+      failCount: new Map(),          // peer infohash -> consecutive failed merges
+      _sub: null,                    // relay subscription
+      _announceTimer: null,
+      _flushTimer: null,
       _chain: Promise.resolve()      // serialises (re)publishing
     };
   }
@@ -226,6 +260,7 @@ class BitBoardEngine extends EventEmitter {
       fs.mkdirSync(this.boardDir(name), { recursive: true });
       const board = this._newBoard(name, saved[name].createdAt);
       this.boards.set(name, board);
+      this._startSignal(board);
       this._scanFiles(board);
       this._emitBoardsChanged();
       try {
@@ -262,11 +297,13 @@ class BitBoardEngine extends EventEmitter {
       fs.mkdirSync(this.boardDir(name), { recursive: true });
       const board = this._newBoard(name);
       this.boards.set(name, board);
+      this._startSignal(board);
       this._emitBoardsChanged();   // show the board in the UI right away
 
       try {
         await this._publishLocked(board);
       } catch (err) {
+        this._stopSignal(board);
         this.boards.delete(name);
         this._emitBoardsChanged();
         this.emit('log', `failed to ${verb === 'joined' ? 'join' : 'create'} board "${name}": ${err.message}`);
@@ -369,6 +406,7 @@ class BitBoardEngine extends EventEmitter {
         this._scanFiles(board);
         torrent.on('wire', () => this.emit('log', `peer connected to "${board.name}" swarm`));
         this._emitBoardsChanged();
+        this._scheduleAnnounce(board);   // tell internet peers our new infohash
         finish(null, torrent);
       });
     });
@@ -440,18 +478,34 @@ class BitBoardEngine extends EventEmitter {
       this._connectDirect(board.torrent, addr, port);
       return;
     }
+    this._tryMerge(board, hash, addr, port);
+  }
+
+  /**
+   * Merge a peer's torrent `hash` into `board` unless we already did, are doing
+   * it, or failed recently. `addr`/`port` are optional: LAN beacons know where
+   * the peer is; internet announcements don't, and rely on trackers/DHT.
+   */
+  _tryMerge(board, hash, addr, port) {
+    if (hash === board.infoHash) return;
     if (board.seen.has(hash) || board.merging.has(hash)) return;
     if ((board.retryAt.get(hash) || 0) > Date.now()) return;
 
-    this._mergeFromPeer(board, hash, addr, port).catch((err) => {
-      board.retryAt.set(hash, Date.now() + RETRY_COOLDOWN_MS);
-      this.emit('log', `sync of "${board.name}" from ${addr} failed: ${err.message}`);
+    this._mergeFromPeer(board, hash, addr, port).then(() => {
+      board.failCount.delete(hash);
+    }).catch((err) => {
+      // Exponential back-off so an offline peer isn't hammered.
+      const n = (board.failCount.get(hash) || 0) + 1;
+      board.failCount.set(hash, n);
+      const wait = Math.min(RETRY_COOLDOWN_MS * Math.pow(2, n - 1), MAX_RETRY_COOLDOWN_MS);
+      board.retryAt.set(hash, Date.now() + wait);
+      this.emit('log', `sync of "${board.name}" from ${addr || 'internet peer'} failed: ${err.message}`);
     });
   }
 
   /** Connect straight to a peer we discovered on the LAN (no tracker/DHT). */
   _connectDirect(torrent, addr, port) {
-    if (!torrent || torrent.destroyed || !(port > 0)) return;
+    if (!torrent || torrent.destroyed || !addr || !(port > 0)) return;
     const go = () => { try { torrent.addPeer(`${addr}:${port}`); } catch (_) { } };
     if (torrent.infoHash) go(); else torrent.once('infoHash', go);
   }
@@ -464,7 +518,7 @@ class BitBoardEngine extends EventEmitter {
       fs.rmSync(stageRoot, { recursive: true, force: true });
       fs.mkdirSync(stageRoot, { recursive: true });
 
-      this.emit('log', `syncing "${board.name}" from ${addr}…`);
+      this.emit('log', `syncing "${board.name}" from ${addr || 'internet peers (tracker/DHT)'}…`);
       const staged = await this._fetchStaged(board, hash, stageRoot, addr, port);
       const added = this._importStaged(board, staged);
       board.seen.add(hash);
@@ -590,6 +644,79 @@ class BitBoardEngine extends EventEmitter {
       added++;
     }
     return added;
+  }
+
+  /* ---------------- internet rendezvous (relay) ---------------- */
+
+  _startSignal(board) {
+    if (!this.signal || board._sub) return;
+    board._sub = this.signal.subscribe(signalTopic(board.name), (msg) => this._onSignal(board, msg));
+  }
+
+  _stopSignal(board) {
+    if (board._sub) { try { board._sub.close(); } catch (_) { } board._sub = null; }
+    clearTimeout(board._announceTimer);
+    clearTimeout(board._flushTimer);
+  }
+
+  /** Periodic work: heartbeat announcements + retry of unfinished merges. */
+  _startSignalTimers() {
+    if (!this.signal || this._signalTimers.length) return;
+    this._signalTimers.push(setInterval(() => {
+      for (const b of this.boards.values()) this._announceNow(b);
+    }, SIGNAL_HEARTBEAT_MS));
+    this._signalTimers.push(setInterval(() => this._signalTick(), SIGNAL_TICK_MS));
+    for (const t of this._signalTimers) if (t.unref) t.unref();
+  }
+
+  _scheduleAnnounce(board) {
+    if (!this.signal || this._destroyed) return;
+    clearTimeout(board._announceTimer);
+    board._announceTimer = setTimeout(() => this._announceNow(board), SIGNAL_ANNOUNCE_DEBOUNCE_MS);
+  }
+
+  _announceNow(board) {
+    if (!this.signal || this._destroyed || !board.torrent) return;
+    this.signal.publish(signalTopic(board.name), {
+      app: 'bitboard',
+      v: 1,
+      peerId: this.peerId(),
+      board: board.name,
+      infoHash: board.infoHash,
+      ts: Date.now()
+    }).catch((err) => this.emit('log', `could not announce "${board.name}": ${err.message}`));
+  }
+
+  /** A relay message for `board`. Batched so a backlog collapses to the newest per peer. */
+  _onSignal(board, msg) {
+    if (this._destroyed || !msg || msg.app !== 'bitboard') return;
+    if (msg.peerId === this.peerId()) return; // our own announcement
+    if (!/^[0-9a-f]{40}$/i.test(String(msg.infoHash || ''))) return;
+    if (typeof msg.peerId !== 'string' || !msg.peerId) return;
+    const prev = board.signalInbox.get(msg.peerId);
+    if (!prev || (Number(msg.ts) || 0) >= (Number(prev.ts) || 0)) board.signalInbox.set(msg.peerId, msg);
+    if (board._flushTimer) return;
+    board._flushTimer = setTimeout(() => {
+      board._flushTimer = null;
+      const batch = [...board.signalInbox.values()];
+      board.signalInbox.clear();
+      for (const m of batch) {
+        const hash = m.infoHash.toLowerCase();
+        board.signalPeers.set(m.peerId, { hash, at: Date.now() });
+        this._tryMerge(board, hash, null, 0);
+      }
+    }, SIGNAL_BATCH_MS);
+  }
+
+  /** Retry merges from internet peers that announced recently but haven't synced yet. */
+  _signalTick() {
+    const now = Date.now();
+    for (const b of this.boards.values()) {
+      for (const [id, p] of b.signalPeers) {
+        if (now - p.at > SIGNAL_TTL_MS) { b.signalPeers.delete(id); continue; }
+        this._tryMerge(b, p.hash, null, 0);
+      }
+    }
   }
 
   /* ---------------- LAN discovery (UDP multicast + broadcast) ---------------- */
@@ -786,6 +913,10 @@ class BitBoardEngine extends EventEmitter {
 
   destroy() {
     this._destroyed = true;
+    for (const t of this._signalTimers) clearInterval(t);
+    this._signalTimers = [];
+    for (const b of this.boards.values()) this._stopSignal(b);
+    if (this.signal && this.signal.close) try { this.signal.close(); } catch (_) { }
     if (this.beaconTimer) clearInterval(this.beaconTimer);
     if (this.socket) try { this.socket.close(); } catch (_) { }
     if (this.client) try { this.client.destroy(); } catch (_) { }

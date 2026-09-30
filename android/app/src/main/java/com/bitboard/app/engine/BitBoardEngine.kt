@@ -3,6 +3,7 @@ package com.bitboard.app.engine
 import android.content.Context
 import android.os.Build
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
@@ -89,6 +90,13 @@ class BitBoardEngine(val context: Context) {
     /** name -> last beacon time for boards seen on the LAN but NOT joined. */
     private val discoveredMap = ConcurrentHashMap<String, Long>()
 
+    /** Internet rendezvous: exchanges infohashes with devices on OTHER networks. */
+    private val signal = SignalChannel(log = { log(it) })
+    private var signalLoops: Job? = null
+
+    /** Latest infohash announced by an internet peer. */
+    private class SignalPeer(val hash: String, val at: Long)
+
     private lateinit var dataDir: File
     private lateinit var boardsDir: File
     private lateinit var torrentsDir: File
@@ -145,6 +153,12 @@ class BitBoardEngine(val context: Context) {
         val merging: MutableSet<String> = ConcurrentHashMap.newKeySet()   // peer hashes in flight
         val retryAt = ConcurrentHashMap<String, Long>()
         val lanPeers = ConcurrentHashMap<String, Long>()                  // peerId -> last beacon
+        val signalPeers = ConcurrentHashMap<String, SignalPeer>()         // relay peerId -> announcement
+        val signalInbox = ConcurrentHashMap<String, JSONObject>()         // relay peerId -> newest raw msg
+        val failCount = ConcurrentHashMap<String, Int>()                  // peer hash -> failed merges
+        @Volatile var sub: SignalChannel.Subscription? = null
+        @Volatile var announceJob: Job? = null
+        @Volatile var flushJob: Job? = null
         val publishLock = Mutex()
         @Volatile var mergeProgress = 1f
     }
@@ -177,7 +191,10 @@ class BitBoardEngine(val context: Context) {
             // Start discovery BEFORE restoring boards: restoring re-seeds every
             // board (slow), and beacons must not wait for that.
             discovery = LanDiscovery(this@BitBoardEngine).also { it.start() }
+            startSignalLoops()
             restoreBoards()
+            // Idempotent: also covers a stop()/start() cycle within one process.
+            boardMap.values.forEach { startSignal(it) }
         }
     }
 
@@ -205,8 +222,13 @@ class BitBoardEngine(val context: Context) {
         started = false
         try { discovery?.stop() } catch (_: Exception) {}
         discovery = null
+        signalLoops?.cancel()
+        signalLoops = null
+        boardMap.values.forEach { stopSignal(it) }
         try { session.stop() } catch (_: Exception) {}
     }
+
+    private fun dhtNodes(): Long = try { session.dhtNodes() } catch (_: Throwable) { -1L }
 
     /** The TCP/uTP port libtorrent really listens on (announced in beacons). */
     fun listenPort(): Int = try {
@@ -316,11 +338,13 @@ class BitBoardEngine(val context: Context) {
         }
         if (!created) return board
 
+        startSignal(board)
         scanFiles(board)
         publishBoards() // show in UI right away
         try {
             publishLocked(board)
         } catch (e: Exception) {
+            stopSignal(board)
             boardMap.remove(n)
             publishBoards()
             log("failed to $verb board \"$n\": ${e.message}")
@@ -432,6 +456,7 @@ class BitBoardEngine(val context: Context) {
         scanFiles(board)
         if (board.handle != null) {
             log("published \"${board.name}\" (${newHash.take(12)}…)")
+            scheduleAnnounce(board) // tell internet peers our new infohash
         } else {
             log("\"${board.name}\" was added but is not seeding yet")
         }
@@ -510,6 +535,17 @@ class BitBoardEngine(val context: Context) {
             connectDirect(board, addr, port)
             return
         }
+        tryMerge(board, hash, addr, port)
+    }
+
+    /**
+     * Merge a peer's torrent [hash] into [board] unless we already did, are
+     * doing it, or failed recently. [addr]/[port] are optional: LAN beacons
+     * know where the peer is; internet announcements don't ("" / 0) and rely
+     * on trackers / DHT to connect.
+     */
+    private fun tryMerge(board: Board, hash: String, addr: String, port: Int) {
+        if (hash.equals(board.infoHash, true)) return
         if (board.seen.contains(hash)) return
         if ((board.retryAt[hash] ?: 0L) > System.currentTimeMillis()) return
         if (!board.merging.add(hash)) return // already being fetched
@@ -517,13 +553,113 @@ class BitBoardEngine(val context: Context) {
         scope.launch {
             try {
                 mergeFromPeer(board, hash, addr, port)
+                board.failCount.remove(hash)
             } catch (e: Exception) {
-                board.retryAt[hash] = System.currentTimeMillis() + Protocol.RETRY_COOLDOWN_MS
-                log("sync of \"${board.name}\" from $addr failed: ${e.message}")
+                // Exponential back-off so an offline peer isn't hammered.
+                val n = (board.failCount[hash] ?: 0) + 1
+                board.failCount[hash] = n
+                val wait = minOf(Protocol.RETRY_COOLDOWN_MS * (1L shl (n - 1).coerceAtMost(10)), Protocol.MAX_RETRY_COOLDOWN_MS)
+                board.retryAt[hash] = System.currentTimeMillis() + wait
+                log("sync of \"${board.name}\" from ${addr.ifEmpty { "internet peer" }} failed: ${e.message}")
             } finally {
                 board.merging.remove(hash)
                 board.mergeProgress = 1f
                 publishBoards()
+            }
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* internet rendezvous (relay)                                         */
+    /* ------------------------------------------------------------------ */
+
+    private fun startSignal(board: Board) {
+        if (board.sub != null) return
+        board.sub = signal.subscribe(Protocol.signalTopic(board.name)) { msg -> onSignal(board, msg) }
+    }
+
+    private fun stopSignal(board: Board) {
+        board.sub?.close()
+        board.sub = null
+        board.announceJob?.cancel()
+        board.flushJob?.cancel()
+    }
+
+    /** Heartbeat announcements + retry of unfinished merges. */
+    private fun startSignalLoops() {
+        signalLoops?.cancel()
+        signalLoops = scope.launch {
+            launch {
+                while (true) {
+                    delay(Protocol.SIGNAL_HEARTBEAT_MS)
+                    boardMap.values.forEach { announceNow(it) }
+                }
+            }
+            launch {
+                while (true) {
+                    delay(Protocol.SIGNAL_TICK_MS)
+                    signalTick()
+                }
+            }
+        }
+    }
+
+    private fun scheduleAnnounce(board: Board) {
+        if (!started) return
+        board.announceJob?.cancel()
+        board.announceJob = scope.launch {
+            delay(Protocol.SIGNAL_ANNOUNCE_DEBOUNCE_MS)
+            announceNow(board)
+        }
+    }
+
+    private fun announceNow(board: Board) {
+        if (board.handle == null) return
+        val payload = JSONObject()
+            .put("app", "bitboard")
+            .put("v", 1)
+            .put("peerId", peerId)
+            .put("board", board.name)
+            .put("infoHash", board.infoHash)
+            .put("ts", System.currentTimeMillis())
+        scope.launch {
+            try {
+                signal.publish(Protocol.signalTopic(board.name), payload)
+                log("announced \"${board.name}\" ${board.infoHash.take(8)}… to relay")
+            } catch (e: Exception) {
+                log("could not announce \"${board.name}\": ${e.message}")
+            }
+        }
+    }
+
+    /** A relay message for [board] (runs on the signal thread). Batched so a backlog collapses to the newest per peer. */
+    private fun onSignal(board: Board, msg: JSONObject) {
+        if (msg.optString("app") != "bitboard") return
+        val from = msg.optString("peerId")
+        if (from.isEmpty() || from == peerId) return // ours, or malformed
+        if (!Protocol.isInfoHash(msg.optString("infoHash"))) return
+        log("relay: \"${board.name}\" peer ${from.take(4)} announced ${msg.optString("infoHash").take(8)}…")
+        val prev = board.signalInbox[from]
+        if (prev == null || msg.optLong("ts", 0L) >= prev.optLong("ts", 0L)) board.signalInbox[from] = msg
+        if (board.flushJob?.isActive == true) return
+        board.flushJob = scope.launch {
+            delay(Protocol.SIGNAL_BATCH_MS)
+            for (id in board.signalInbox.keys.toList()) {
+                val m = board.signalInbox.remove(id) ?: continue
+                val hash = m.optString("infoHash").lowercase()
+                board.signalPeers[id] = SignalPeer(hash, System.currentTimeMillis())
+                tryMerge(board, hash, "", 0)
+            }
+        }
+    }
+
+    /** Retry merges from internet peers that announced recently but haven't synced yet. */
+    private fun signalTick() {
+        val now = System.currentTimeMillis()
+        for (b in boardMap.values) {
+            for ((id, p) in b.signalPeers.entries.toList()) {
+                if (now - p.at > Protocol.SIGNAL_TTL_MS) { b.signalPeers.remove(id); continue }
+                tryMerge(b, p.hash, "", 0)
             }
         }
     }
@@ -546,7 +682,7 @@ class BitBoardEngine(val context: Context) {
                 stageRoot.mkdirs()
                 board.mergeProgress = 0f
                 publishBoards()
-                log("syncing \"${board.name}\" from $addr…")
+                log("syncing \"${board.name}\" from ${addr.ifEmpty { "internet peers (tracker/DHT)" }}…")
 
                 onLt { session.download(Protocol.magnetUri(board.name, hash), stageRoot, torrent_flags_t()) }
 
@@ -567,6 +703,7 @@ class BitBoardEngine(val context: Context) {
                 // 2. connect directly, wait for metadata, choose the missing files
                 var wanted: List<String>? = null
                 var lastConnect = 0L
+                var lastStatus = 0L
                 var lastDone = -1L
                 var lastMove = System.currentTimeMillis()
                 while (true) {
@@ -579,7 +716,12 @@ class BitBoardEngine(val context: Context) {
                             lastMove = now
                             if (wanted.isEmpty()) break // we already have everything
                         } else if (now - t0 > Protocol.METADATA_TIMEOUT_MS) {
-                            throw IOException("timed out fetching torrent metadata")
+                            throw IOException("timed out fetching torrent metadata " +
+                                "(peers=${st.numPeers()}, dht nodes=${dhtNodes()}) — " +
+                                "the other device is unreachable (NAT/firewall) or offline")
+                        } else if (now - lastStatus > 8_000) {
+                            lastStatus = now
+                            log("waiting for peer: peers=${st.numPeers()}, dht nodes=${dhtNodes()}")
                         }
                     } else {
                         val total = st.totalWanted()

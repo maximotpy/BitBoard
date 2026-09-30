@@ -78,7 +78,7 @@ class MainActivity : AppCompatActivity() {
                 launch {
                     App.engine(applicationContext).logs.collect { logs ->
                         if (logs.isNotEmpty()) {
-                            findViewById<android.widget.TextView>(R.id.logLine).text = logs.last()
+                            findViewById<android.widget.TextView>(R.id.logLine).text = logs.takeLast(6).joinToString("\n")
                         }
                     }
                 }
