@@ -542,3 +542,226 @@ body {
   gap: 8px;
   margin-top: 10px;
 }
+
+/* ---------------- Board options menu ---------------- */
+
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  background: #000000b0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 150;
+}
+
+.menu-box {
+  width: 280px;
+  background: var(--sidebar);
+  border: 1px solid #111;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.menu-title {
+  font-size: 14px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  word-break: break-word;
+}
+
+.menu-option {
+  background: none;
+  border: 1px solid #111;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.menu-option:hover {
+  background: var(--sidebar-hover);
+}
+
+.menu-cancel {
+  color: var(--text-dim);
+}
+
+/* ---------------- Mini action buttons (image rows, blacklist) ---------------- */
+
+.file-actions {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.mini-btn {
+  background: none;
+  border: 1px solid #111;
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+
+.mini-btn:hover {
+  background: var(--sidebar-hover);
+  color: var(--text);
+}
+
+/* ---------------- Settings panel ---------------- */
+
+#settings-backdrop {
+  position: fixed;
+  inset: 0;
+  background: #000000b0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 120;
+}
+
+#settings-backdrop.hidden {
+  display: none;
+}
+
+#settings-panel {
+  width: 460px;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--sidebar);
+  border: 1px solid #111;
+  padding: 20px;
+}
+
+#settings-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.settings-section {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin: 14px 0 6px 0;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text);
+  padding: 4px 0;
+  cursor: pointer;
+}
+
+.settings-row input {
+  accent-color: #6e6e6e;
+}
+
+.blacklist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.blacklist-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--row-alt);
+  border: 1px solid #111;
+  padding: 6px 8px;
+}
+
+.blacklist-label {
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.blacklist-empty {
+  font-size: 12px;
+  color: var(--text-dim);
+  padding: 4px 0;
+}
+
+.settings-peerid {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 14px;
+  word-break: break-all;
+}
+
+#settings-buttons {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 14px;
+}
+
+/* ---------------- Icon picker ---------------- */
+
+#icon-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  background: #000000b0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 130;
+}
+
+#icon-picker-backdrop.hidden {
+  display: none;
+}
+
+#icon-picker {
+  width: 380px;
+  background: var(--sidebar);
+  border: 1px solid #111;
+  padding: 20px;
+}
+
+#icon-picker-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+#icon-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 4px;
+}
+
+.icon-option {
+  background: var(--row-alt);
+  border: 1px solid #111;
+  font-size: 18px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.icon-option:hover {
+  background: var(--sidebar-hover);
+}
+
+.icon-option.selected {
+  border-color: var(--text);
+}
+
+#icon-picker-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}

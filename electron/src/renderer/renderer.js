@@ -16,6 +16,7 @@ const els = {
   addImageBtn: document.getElementById('btn-add-image'),
   addBoardBtn: document.getElementById('btn-add-board'),
   joinBoardBtn: document.getElementById('btn-join-board'),
+  settingsBtn: document.getElementById('btn-settings'),
   log: document.getElementById('log')
 };
 
@@ -25,6 +26,15 @@ let selectedBoard = null;
 let currentView = 'gallery';   // 'gallery' (image board) | 'details' (file list)
 let lightboxFiles = [];        // files of the board shown in the lightbox
 let lightboxIndex = -1;
+let settings = null;           // { showLog, confirmLeaveBoard, imageHashes, boards, peers }
+
+const ICON_PALETTE = [
+  '\uD83D\uDCCC', '\uD83C\uDFA8', '\uD83D\uDCF7', '\uD83D\uDC31', '\uD83D\uDC15',
+  '\uD83C\uDF55', '\uD83D\uDE97', '\u2708\uFE0F', '\uD83C\uDFD6', '\u26F0',
+  '\uD83C\uDFAE', '\uD83C\uDFB5', '\uD83D\uDCBB', '\uD83D\uDCDA', '\uD83D\uDCBC',
+  '\uD83D\uDD25', '\u2B50', '\uD83C\uDF19', '\u2600\uFE0F', '\uD83C\uDF08',
+  '\uD83C\uDF40', '\uD83C\uDF0A', '\uD83C\uDF82', '\uD83C\uDF81'
+];
 
 function fmtSize(bytes) {
   if (bytes < 1024) return bytes + ' B';
@@ -43,11 +53,11 @@ function renderBoardList() {
   for (const b of boards) {
     const item = document.createElement('div');
     item.className = 'board-item' + (b.name === selectedBoard ? ' active' : '');
-    item.title = b.name;
+    item.title = b.name + ' (right-click for options)';
 
     const icon = document.createElement('span');
     icon.className = 'board-icon';
-    icon.textContent = '\u25A6';
+    icon.textContent = b.icon || '\u25A6';
 
     const name = document.createElement('span');
     name.className = 'board-name';
@@ -59,6 +69,11 @@ function renderBoardList() {
       selectedBoard = b.name;
       renderBoardList();
       renderContent();
+    });
+    // Right-click / long-press: board options (leave / icon / blacklist).
+    item.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      showBoardMenu(b.name);
     });
     els.boardList.appendChild(item);
   }
@@ -164,9 +179,26 @@ function renderDetails(board) {
     size.className = 'file-size';
     size.textContent = fmtSize(f.size);
 
+    // Per-image actions: blacklist by content hash / delete.
+    const actions = document.createElement('div');
+    actions.className = 'file-actions';
+    const blockBtn = document.createElement('button');
+    blockBtn.className = 'mini-btn';
+    blockBtn.title = 'Blacklist this image (by content hash)';
+    blockBtn.textContent = '\u26D4';
+    blockBtn.addEventListener('click', () => blacklistImage(board.name, f.name));
+    const delBtn = document.createElement('button');
+    delBtn.className = 'mini-btn';
+    delBtn.title = 'Delete this image locally';
+    delBtn.textContent = '\uD83D\uDDD1';
+    delBtn.addEventListener('click', () => deleteImage(board.name, f.name));
+    actions.appendChild(blockBtn);
+    actions.appendChild(delBtn);
+
     row.appendChild(thumb);
     row.appendChild(info);
     row.appendChild(size);
+    row.appendChild(actions);
     els.imageList.appendChild(row);
   }
 }
@@ -334,6 +366,180 @@ els.addImageBtn.addEventListener('click', () => {
   if (selectedBoard) window.bitboard.addImage(selectedBoard);
 });
 
+/* ---------------- board options menu (leave / icon / blacklist) ---------------- */
+
+function showBoardMenu(name) {
+  promptChoice('Board "' + name + '"', ['Set icon', 'Leave board', 'Blacklist board'])
+    .then((choice) => {
+      if (choice === 0) showIconPicker(name);
+      else if (choice === 1) confirmLeaveBoard(name);
+      else if (choice === 2) blacklistBoard(name);
+    });
+}
+
+/* Minimal in-page choice dialog. Resolves with the chosen index, or null. */
+function promptChoice(title, options) {
+  return new Promise((resolve) => {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'menu-backdrop';
+    const box = document.createElement('div');
+    box.className = 'menu-box';
+    const t = document.createElement('div');
+    t.className = 'menu-title';
+    t.textContent = title;
+    box.appendChild(t);
+    const done = (value) => { backdrop.remove(); resolve(value); };
+    options.forEach((opt, i) => {
+      const b = document.createElement('button');
+      b.className = 'menu-option';
+      b.textContent = opt;
+      b.addEventListener('click', () => done(i));
+      box.appendChild(b);
+    });
+    const cancel = document.createElement('button');
+    cancel.className = 'menu-option menu-cancel';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', () => done(null));
+    box.appendChild(cancel);
+    backdrop.appendChild(box);
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) done(null); });
+    document.body.appendChild(backdrop);
+  });
+}
+
+function confirmLeaveBoard(name) {
+  const doLeave = (deleteFiles) => {
+    window.bitboard.leaveBoard(name, deleteFiles).catch((err) => {
+      logLine('Failed to leave "' + name + '": ' + String((err && err.message) || err));
+    });
+  };
+  if (settings && settings.confirmLeaveBoard) {
+    promptChoice('Leave "' + name + '"? You will stop syncing it.',
+      ['Leave (keep files)', 'Leave and delete files'])
+      .then((choice) => {
+        if (choice === 0) doLeave(false);
+        else if (choice === 1) doLeave(true);
+      });
+  } else {
+    doLeave(false);
+  }
+}
+
+function blacklistBoard(name) {
+  window.bitboard.addBoardBlacklist(name);
+  logLine('Board "' + name + '" blacklisted — unblock it in Settings.');
+}
+
+/* ---------------- board icon picker ---------------- */
+
+let iconPickerBoard = null;
+
+function showIconPicker(name) {
+  iconPickerBoard = name;
+  const grid = document.getElementById('icon-grid');
+  grid.innerHTML = '';
+  const current = (boards.find(b => b.name === name) || {}).icon || '';
+  for (const emoji of ICON_PALETTE) {
+    const b = document.createElement('button');
+    b.className = 'icon-option' + (emoji === current ? ' selected' : '');
+    b.textContent = emoji;
+    b.addEventListener('click', () => {
+      window.bitboard.setBoardIcon(iconPickerBoard, emoji);
+      document.getElementById('icon-picker-backdrop').classList.add('hidden');
+    });
+    grid.appendChild(b);
+  }
+  document.getElementById('icon-picker-backdrop').classList.remove('hidden');
+}
+
+document.getElementById('icon-cancel').addEventListener('click', () => {
+  document.getElementById('icon-picker-backdrop').classList.add('hidden');
+});
+document.getElementById('icon-clear').addEventListener('click', () => {
+  if (iconPickerBoard) window.bitboard.setBoardIcon(iconPickerBoard, '');
+  document.getElementById('icon-picker-backdrop').classList.add('hidden');
+});
+
+/* ---------------- image actions (blacklist by hash / delete) ---------------- */
+
+async function blacklistImage(boardName, fileName) {
+  const hash = await window.bitboard.imageHash(boardName, fileName);
+  if (!hash) { logLine('Could not hash "' + fileName + '"'); return; }
+  await window.bitboard.addImageHash(hash);
+  logLine('Image blacklisted by hash ' + hash.slice(0, 12) + '… — it is now hidden and never synced.');
+}
+
+function deleteImage(boardName, fileName) {
+  window.bitboard.removeImage(boardName, fileName).catch((err) => {
+    logLine('Failed to delete "' + fileName + '": ' + String((err && err.message) || err));
+  });
+}
+
+/* ---------------- settings panel ---------------- */
+
+function openSettings() {
+  window.bitboard.getSettings().then((s) => {
+    settings = s;
+    document.getElementById('setting-show-log').checked = !!s.showLog;
+    document.getElementById('setting-confirm-leave').checked = !!s.confirmLeaveBoard;
+    renderBlacklist('blacklist-images', s.imageHashes || [], (h) => window.bitboard.removeImageHash(h), (x) => x.slice(0, 16) + '…');
+    renderBlacklist('blacklist-boards', s.boards || [], (n) => window.bitboard.removeBoardBlacklist(n));
+    renderBlacklist('blacklist-peers', s.peers || [], (p) => window.bitboard.removePeerBlacklist(p), (x) => x.slice(0, 12) + '…');
+    window.bitboard.getPeerId().then((id) => {
+      document.getElementById('settings-peerid').textContent = 'Your peer ID: ' + id;
+    });
+    document.getElementById('settings-backdrop').classList.remove('hidden');
+  });
+}
+
+function renderBlacklist(containerId, items, onRemove, fmt) {
+  const box = document.getElementById(containerId);
+  box.innerHTML = '';
+  if (!items.length) {
+    const e = document.createElement('div');
+    e.className = 'blacklist-empty';
+    e.textContent = 'Nothing blacklisted.';
+    box.appendChild(e);
+    return;
+  }
+  for (const item of items) {
+    const row = document.createElement('div');
+    row.className = 'blacklist-row';
+    const label = document.createElement('span');
+    label.className = 'blacklist-label';
+    label.textContent = fmt ? fmt(item) : item;
+    label.title = item;
+    const btn = document.createElement('button');
+    btn.className = 'mini-btn';
+    btn.textContent = 'Remove';
+    btn.addEventListener('click', () => {
+      onRemove(item);
+      row.remove();
+      if (!box.children.length) {
+        const e = document.createElement('div');
+        e.className = 'blacklist-empty';
+        e.textContent = 'Nothing blacklisted.';
+        box.appendChild(e);
+      }
+    });
+    row.appendChild(label);
+    row.appendChild(btn);
+    box.appendChild(row);
+  }
+}
+
+els.settingsBtn.addEventListener('click', openSettings);
+document.getElementById('settings-close').addEventListener('click', () => {
+  document.getElementById('settings-backdrop').classList.add('hidden');
+});
+document.getElementById('setting-show-log').addEventListener('change', (e) => {
+  window.bitboard.setSetting('showLog', e.target.checked);
+  els.log.parentElement.style.display = e.target.checked ? '' : 'none';
+});
+document.getElementById('setting-confirm-leave').addEventListener('change', (e) => {
+  window.bitboard.setSetting('confirmLeaveBoard', e.target.checked);
+});
+
 /* ---------------- engine events ---------------- */
 
 window.bitboard.onBoards((snapshot) => {
@@ -364,6 +570,8 @@ window.bitboard.onLog(logLine);
 (async () => {
   boards = await window.bitboard.getBoards();
   discovered = await window.bitboard.getDiscovered();
+  settings = await window.bitboard.getSettings();
+  if (!settings.showLog) els.log.parentElement.style.display = 'none';
   if (boards.length) selectedBoard = boards[0].name;
   renderBoardList();
   renderContent();

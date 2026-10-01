@@ -120,6 +120,70 @@ function sha1Buf(buf) {
 }
 
 /**
+ * User settings + blacklists, persisted in <dataDir>/settings.json.
+ * Blacklists:
+ *  - imageHashes: SHA-1 of image CONTENT — an image is blocked on every
+ *    device that has the same bytes, regardless of its file name.
+ *  - boards: board names that must never be joined and are hidden from the
+ *    "discovered on network" list.
+ *  - peers: peerIds (from LAN beacons / relay announcements) whose boards
+ *    and merges are ignored entirely.
+ */
+class SettingsStore {
+  constructor(dataDir) {
+    this.file = path.join(dataDir, 'settings.json');
+    this.data = this._load();
+  }
+
+  _load() {
+    const defaults = {
+      showLog: true,
+      confirmLeaveBoard: true,
+      imageHashes: [],
+      boards: [],
+      peers: []
+    };
+    try {
+      const saved = JSON.parse(fs.readFileSync(this.file, 'utf8'));
+      return Object.assign(defaults, saved);
+    } catch (_) {
+      return defaults;
+    }
+  }
+
+  save() {
+    try { fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2)); } catch (_) { }
+  }
+
+  get() { return this.data; }
+
+  set(key, value) {
+    this.data[key] = value;
+    this.save();
+  }
+
+  add(list, value) {
+    const v = String(value || '').trim();
+    if (!v) return;
+    const arr = this.data[list] || [];
+    if (!arr.includes(v)) { arr.push(v); this.data[list] = arr; this.save(); }
+  }
+
+  remove(list, value) {
+    const v = String(value || '').trim();
+    this.data[list] = (this.data[list] || []).filter((x) => x !== v);
+    this.save();
+  }
+
+  isImageBlocked(hash) { return (this.data.imageHashes || []).includes(String(hash).toLowerCase()); }
+  isBoardBlocked(name) { return (this.data.boards || []).includes(String(name || '').trim()); }
+  isPeerBlocked(id) {
+    const v = String(id || '').trim();
+    return !!v && (this.data.peers || []).includes(v);
+  }
+}
+
+/**
  * Deterministic info-hash for a board name: every device that wants to join
  * "Vacation" computes the same infohash and finds the swarm, even before it
  * has ever seen a .torrent file. The actual torrent payload is a single
@@ -161,6 +225,8 @@ class BitBoardEngine extends EventEmitter {
     this.client = null;
     this.boards = new Map();      // name -> board (see _newBoard)
     this.state = this._loadState();
+    this.settings = new SettingsStore(this.dataDir);
+    this.boardIcons = new Map();  // name -> emoji (persisted in state.json)
     this.socket = null;
     this.beaconTimer = null;
     this._destroyed = false;
@@ -226,14 +292,21 @@ class BitBoardEngine extends EventEmitter {
 
   _loadState() {
     try {
-      return JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
+      const state = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
+      // Board icons (optional; older state files don't have them).
+      if (state.icons && typeof state.icons === 'object') {
+        for (const [k, v] of Object.entries(state.icons)) {
+          if (typeof v === 'string' && v) this.boardIcons.set(k, v);
+        }
+      }
+      return state;
     } catch (_) {
       return { boards: {} };
     }
   }
 
   _saveState() {
-    const out = { boards: {} };
+    const out = { boards: {}, icons: {} };
     for (const [name, b] of this.boards) {
       out.boards[name] = {
         name: b.name,
@@ -241,6 +314,7 @@ class BitBoardEngine extends EventEmitter {
         createdAt: b.createdAt || Date.now()
       };
     }
+    for (const [name, icon] of this.boardIcons) out.icons[name] = icon;
     try { fs.writeFileSync(this.stateFile, JSON.stringify(out, null, 2)); } catch (_) { }
   }
 
@@ -323,6 +397,68 @@ class BitBoardEngine extends EventEmitter {
 
   createBoard(name) { return this._ensureBoard(name, 'created'); }
   joinBoard(name) { return this._ensureBoard(name, 'joined'); }
+
+  /**
+   * Leave a board: stop seeding/announcing it and forget it. The local
+   * folder is kept unless deleteFiles is set, so "leave + rejoin" keeps the
+   * images the device already had.
+   */
+  async leaveBoard(name, deleteFiles = false) {
+    await this._ready;
+    name = String(name || '').trim();
+    const board = this.boards.get(name);
+    if (!board) return false;
+    this._stopSignal(board);
+    const t = board.torrent;
+    board.torrent = null;
+    if (t) await new Promise((res) => { try { t.destroy(() => res()); } catch (_) { res(); } });
+    this.boards.delete(name);
+    if (deleteFiles) {
+      try { fs.rmSync(board.dir, { recursive: true, force: true }); } catch (_) { }
+    }
+    this._saveState();
+    this._emitBoardsChanged();
+    this._discovered.delete(name);
+    this._emitDiscoveredChanged();
+    this.emit('log', `left board "${name}"` + (deleteFiles ? ' (files deleted)' : ''));
+    return true;
+  }
+
+  /** Set (or clear with '') the emoji icon shown next to a board. */
+  setBoardIcon(name, icon) {
+    name = String(name || '').trim();
+    if (!name) return;
+    if (icon && String(icon).trim()) this.boardIcons.set(name, String(icon).trim().slice(0, 8));
+    else this.boardIcons.delete(name);
+    this._saveState();
+    this._emitBoardsChanged();
+  }
+
+  /** SHA-1 of an image's content (for the blacklist UI). */
+  imageHash(boardName, fileName) {
+    const board = this.boards.get(boardName);
+    if (!board) return null;
+    try {
+      return sha1Buf(fs.readFileSync(path.join(board.dir, path.basename(fileName))));
+    } catch (_) { return null; }
+  }
+
+  /** Delete a local image from a board and re-publish. */
+  async removeImage(boardName, fileName) {
+    await this._ready;
+    const board = this.boards.get(boardName);
+    if (!board) return false;
+    const p = path.join(board.dir, path.basename(fileName)); // basename: no traversal
+    try {
+      fs.rmSync(p, { force: true });
+    } catch (_) { return false; }
+    this._scanFiles(board);
+    await this._publishLocked(board);
+    this._saveState();
+    this._emitBoardsChanged();
+    this.emit('log', `removed ${path.basename(fileName)} from "${boardName}"`);
+    return true;
+  }
 
   /** Serialise publishes per board so two callers never race the re-seed. */
   _publishLocked(board) {
@@ -419,6 +555,14 @@ class BitBoardEngine extends EventEmitter {
     if (!board) throw new Error('Unknown board: ' + boardName);
     const base = path.basename(srcPath);
     if (!isImageFile(base)) throw new Error('Not an image file: ' + base);
+    // Blacklist check by CONTENT hash: the same image is rejected under any
+    // file name.
+    let digest = null;
+    try { digest = sha1Buf(fs.readFileSync(srcPath)); } catch (_) { }
+    if (digest && this.settings.isImageBlocked(digest)) {
+      this.emit('log', `blocked ${base} — image is blacklisted`);
+      return false;
+    }
     const dest = path.join(board.dir, base);
     fs.copyFileSync(srcPath, dest);
     const st = fs.statSync(dest);
@@ -461,8 +605,13 @@ class BitBoardEngine extends EventEmitter {
    * exchange always converges.
    */
   _handlePeerBoard(name, hash, addr, port, peerId) {
+    // Blacklisted peers are ignored entirely: their boards never show up as
+    // discovered and never merge.
+    if (this.settings.isPeerBlocked(peerId)) return;
     const board = this.boards.get(name);
     if (!board) {
+      // Blacklisted boards are hidden from discovery and never merged.
+      if (this.settings.isBoardBlocked(name)) return;
       // Board we don't have: remember it so the UI can offer it, but NEVER
       // auto-join — a board only lands on this device when the user asks for
       // it (otherwise every board on the LAN would appear here on first run).
@@ -619,6 +768,9 @@ class BitBoardEngine extends EventEmitter {
       try { data = fs.readFileSync(item.full); } catch (_) { continue; }
       const digest = sha1Buf(data);
 
+      // Blacklisted content is never imported.
+      if (this.settings.isImageBlocked(digest)) continue;
+
       // Already have these exact bytes (under any name)? Nothing to do.
       const local = fs.readdirSync(board.dir).filter(isImageFile);
       const dup = local.some((n) => {
@@ -691,6 +843,7 @@ class BitBoardEngine extends EventEmitter {
   _onSignal(board, msg) {
     if (this._destroyed || !msg || msg.app !== 'bitboard') return;
     if (msg.peerId === this.peerId()) return; // our own announcement
+    if (this.settings.isPeerBlocked(msg.peerId)) return; // blacklisted peer
     if (!/^[0-9a-f]{40}$/i.test(String(msg.infoHash || ''))) return;
     if (typeof msg.peerId !== 'string' || !msg.peerId) return;
     const prev = board.signalInbox.get(msg.peerId);
@@ -905,7 +1058,8 @@ class BitBoardEngine extends EventEmitter {
         peers: Math.max(b.torrent ? b.torrent.numPeers : 0, lan),
         progress: 1,
         syncing: b.merging.size > 0,
-        files
+        files,
+        icon: this.boardIcons.get(name) || ''
       });
     }
     return list;

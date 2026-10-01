@@ -63,7 +63,60 @@ app.whenReady().then(async () => {
   // are not structured-cloneable, so they must never cross IPC. Return a
   // plain serializable ack instead; the UI updates via the 'bb:boards' push.
   ipcMain.handle('bb:createBoard', async (_e, name) => { await engine.ready(); await engine.createBoard(name); return { ok: true }; });
-  ipcMain.handle('bb:joinBoard', async (_e, name) => { await engine.ready(); await engine.joinBoard(name); return { ok: true }; });
+  ipcMain.handle('bb:joinBoard', async (_e, name) => {
+    await engine.ready();
+    if (engine.settings.isBoardBlocked(name)) {
+      throw new Error('Board "' + name + '" is blacklisted (unblock it in Settings)');
+    }
+    await engine.joinBoard(name);
+    return { ok: true };
+  });
+  ipcMain.handle('bb:leaveBoard', async (_e, name, deleteFiles) => {
+    await engine.ready();
+    await engine.leaveBoard(name, !!deleteFiles);
+    return { ok: true };
+  });
+  ipcMain.handle('bb:setBoardIcon', (_e, name, icon) => {
+    if (!engine) return { ok: false };
+    engine.setBoardIcon(name, icon);
+    return { ok: true };
+  });
+  ipcMain.handle('bb:removeImage', async (_e, boardName, fileName) => {
+    await engine.ready();
+    await engine.removeImage(boardName, fileName);
+    return { ok: true };
+  });
+  ipcMain.handle('bb:imageHash', (_e, boardName, fileName) => {
+    if (!engine) return null;
+    return engine.imageHash(boardName, fileName);
+  });
+
+  // Settings + blacklists (plain serializable objects only).
+  ipcMain.handle('bb:getSettings', () => {
+    if (!engine) return {};
+    const s = engine.settings.get();
+    return {
+      showLog: s.showLog,
+      confirmLeaveBoard: s.confirmLeaveBoard,
+      imageHashes: [...s.imageHashes],
+      boards: [...s.boards],
+      peers: [...s.peers]
+    };
+  });
+  ipcMain.handle('bb:setSetting', (_e, key, value) => {
+    if (!engine) return { ok: false };
+    if (key === 'showLog' || key === 'confirmLeaveBoard') {
+      engine.settings.set(key, !!value);
+    }
+    return { ok: true };
+  });
+  ipcMain.handle('bb:addImageHash', (_e, hash) => { engine && engine.settings.add('imageHashes', hash); return { ok: true }; });
+  ipcMain.handle('bb:removeImageHash', (_e, hash) => { engine && engine.settings.remove('imageHashes', hash); return { ok: true }; });
+  ipcMain.handle('bb:addBoardBlacklist', (_e, name) => { engine && engine.settings.add('boards', name); return { ok: true }; });
+  ipcMain.handle('bb:removeBoardBlacklist', (_e, name) => { engine && engine.settings.remove('boards', name); return { ok: true }; });
+  ipcMain.handle('bb:addPeerBlacklist', (_e, id) => { engine && engine.settings.add('peers', id); return { ok: true }; });
+  ipcMain.handle('bb:removePeerBlacklist', (_e, id) => { engine && engine.settings.remove('peers', id); return { ok: true }; });
+  ipcMain.handle('bb:getPeerId', () => (engine ? engine.peerId() : ''));
   ipcMain.handle('bb:addImage', async (_e, boardName) => {
     await engine.ready();
     const res = await dialog.showOpenDialog(win, {

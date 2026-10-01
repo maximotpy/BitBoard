@@ -7,6 +7,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
@@ -31,6 +33,12 @@ class BoardActivity : AppCompatActivity() {
     private lateinit var boardName: String
     private lateinit var adapter: ImageAdapter
 
+    /** Emoji palette for the board-icon picker. */
+    private val iconPalette = listOf(
+        "📌", "🎨", "📷", "🐱", "🐶", "🍕", "🚗", "✈️", "🏖", "⛰", "🎮", "🎵",
+        "💻", "📚", "💼", "🔥", "⭐", "🌙", "☀️", "🌈", "🍀", "🌊", "🎂", "🎁"
+    )
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_board)
@@ -38,10 +46,18 @@ class BoardActivity : AppCompatActivity() {
         boardName = intent.getStringExtra(EXTRA_BOARD_NAME) ?: run { finish(); return }
         findViewById<TextView>(R.id.boardTitle).text = boardName
 
-        adapter = ImageAdapter { file -> showFullImage(file) }
+        adapter = ImageAdapter(
+            onClick = { file -> showFullImage(file) },
+            onLongClick = { file -> showImageMenu(file) }
+        )
         val rv = findViewById<RecyclerView>(R.id.imageGrid)
         rv.layoutManager = GridLayoutManager(this, 3)
         rv.adapter = adapter
+
+        // Board menu (leave / icon / blacklist) via the title.
+        findViewById<View>(R.id.boardTitle).setOnLongClickListener {
+            showBoardMenu(); true
+        }
 
         // Refresh whenever the engine publishes a new snapshot (sync progress,
         // newly arrived files, …).
@@ -50,6 +66,123 @@ class BoardActivity : AppCompatActivity() {
                 App.engine(applicationContext).boards.collect { refresh() }
             }
         }
+    }
+
+    /** Long-press on an image: blacklist by content hash / delete. */
+    private fun showImageMenu(file: File) {
+        val options = arrayOf(
+            getString(R.string.blacklist_image),
+            getString(R.string.remove)
+        )
+        AlertDialog.Builder(this)
+            .setTitle(file.name)
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> blacklistImage(file)
+                    1 -> deleteImage(file)
+                }
+            }
+            .show()
+    }
+
+    private fun blacklistImage(file: File) {
+        lifecycleScope.launch {
+            val hash = withContext(Dispatchers.IO) {
+                App.engine(applicationContext).imageHash(file)
+            }
+            if (hash == null) {
+                Toast.makeText(this@BoardActivity, "Could not hash image", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            App.engine(applicationContext).settings.addImageHash(hash)
+            refresh()
+            Toast.makeText(this@BoardActivity, R.string.blocked_image_toast, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun deleteImage(file: File) {
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.remove))
+            .setMessage("Delete \"${file.name}\" from this board?")
+            .setPositiveButton(getString(R.string.remove)) { _, _ ->
+                lifecycleScope.launch {
+                    App.engine(applicationContext).removeImage(boardName, file.name)
+                    refresh()
+                }
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    /** Board menu: leave / icon / blacklist. */
+    private fun showBoardMenu() {
+        val options = arrayOf(
+            getString(R.string.set_icon),
+            getString(R.string.leave_board),
+            getString(R.string.blacklist_board)
+        )
+        AlertDialog.Builder(this)
+            .setTitle(boardName)
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> showIconPicker()
+                    1 -> confirmLeave()
+                    2 -> blacklistBoard()
+                }
+            }
+            .show()
+    }
+
+    private fun showIconPicker() {
+        val current = App.engine(applicationContext).boards.value
+            .find { it.name == boardName }?.icon ?: ""
+        val palette = (iconPalette + (if (current.isNotBlank()) listOf(current) else emptyList()))
+            .distinct().toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.icon_pick_title) + " — " + boardName)
+            .setItems(palette) { _, which ->
+                lifecycleScope.launch {
+                    App.engine(applicationContext).setBoardIcon(boardName, palette[which])
+                }
+            }
+            .setNeutralButton("Clear") { _, _ ->
+                lifecycleScope.launch { App.engine(applicationContext).setBoardIcon(boardName, "") }
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
+    }
+
+    private fun confirmLeave() {
+        val engine = App.engine(applicationContext)
+        if (engine.settings.current().confirmLeaveBoard) {
+            AlertDialog.Builder(this)
+                .setTitle(getString(R.string.leave_board))
+                .setMessage(getString(R.string.leave_confirm, boardName))
+                .setPositiveButton(getString(R.string.leave_keep_files)) { _, _ -> doLeave(false) }
+                .setNeutralButton(getString(R.string.leave_delete_files)) { _, _ -> doLeave(true) }
+                .setNegativeButton(getString(R.string.cancel), null)
+                .show()
+        } else {
+            doLeave(false)
+        }
+    }
+
+    private fun doLeave(deleteFiles: Boolean) {
+        lifecycleScope.launch {
+            App.engine(applicationContext).leaveBoard(boardName, deleteFiles)
+            finish()
+        }
+    }
+
+    private fun blacklistBoard() {
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.blacklist_board))
+            .setMessage("\"$boardName\" will be hidden from discovery and cannot be joined until unblacklisted in Settings.")
+            .setPositiveButton("Blacklist") { _, _ ->
+                App.engine(applicationContext).settings.addBoard(boardName)
+            }
+            .setNegativeButton(getString(R.string.cancel), null)
+            .show()
     }
 
     private fun refresh() {
@@ -71,8 +204,10 @@ class BoardActivity : AppCompatActivity() {
         overlay.setOnClickListener { overlay.visibility = View.GONE }
     }
 
-    private class ImageAdapter(val onClick: (File) -> Unit) :
-        RecyclerView.Adapter<ImageAdapter.Holder>() {
+    private class ImageAdapter(
+        val onClick: (File) -> Unit,
+        val onLongClick: (File) -> Unit
+    ) : RecyclerView.Adapter<ImageAdapter.Holder>() {
 
         private var items: List<File> = emptyList()
 
@@ -100,6 +235,7 @@ class BoardActivity : AppCompatActivity() {
                 }.start()
             }
             holder.itemView.setOnClickListener { onClick(f) }
+            holder.itemView.setOnLongClickListener { onLongClick(f); true }
         }
 
         private fun decodeThumb(f: File, maxDim: Int): android.graphics.Bitmap? {

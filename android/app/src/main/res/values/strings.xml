@@ -8,4 +8,27 @@
     <string name="discovered_header">Discovered on network</string>
     <string name="empty_hint">No boards yet.\n\nTap + to create one (e.g. Vacation), or Join board to sync with another device on the same network.</string>
     <string name="board_empty_hint">No images yet.\n\nUse "Add image" to publish one to the swarm.</string>
+    <string name="settings">Settings</string>
+    <string name="back">Back</string>
+    <string name="remove">Remove</string>
+    <string name="leave_board">Leave board</string>
+    <string name="set_icon">Set icon</string>
+    <string name="blacklist_image">Blacklist image</string>
+    <string name="blacklist_board">Blacklist board</string>
+    <string name="blacklist_peer">Blacklist peer</string>
+    <string name="prefs_header">Preferences</string>
+    <string name="pref_show_log">Show activity log on main screen</string>
+    <string name="pref_confirm_leave">Ask for confirmation before leaving a board</string>
+    <string name="blacklist_images_header">Blacklisted images (by content hash)</string>
+    <string name="blacklist_boards_header">Blacklisted boards</string>
+    <string name="blacklist_peers_header">Blacklisted peers</string>
+    <string name="blacklist_empty">Nothing blacklisted.</string>
+    <string name="leave_confirm">Leave "%1$s"? You will stop syncing it. Your local copy can be kept or deleted.</string>
+    <string name="leave_keep_files">Leave (keep files)</string>
+    <string name="leave_delete_files">Leave and delete files</string>
+    <string name="cancel">Cancel</string>
+    <string name="icon_pick_title">Pick a board icon</string>
+    <string name="blocked_image_toast">Image is blacklisted</string>
+    <string name="peer_id_label">Your peer ID: %1$s</string>
+    <string name="removed_toast">Removed</string>
 </resources>

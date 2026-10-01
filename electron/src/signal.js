@@ -57,6 +57,11 @@ class SignalChannel {
       body: JSON.stringify(obj),
       signal: AbortSignal.timeout(15000)
     });
+    // Drain the response body so undici returns the keep-alive socket to the
+    // pool. Leaving it unread keeps a 'close' listener attached to the shared
+    // socket for every announce, and restoring a dozen boards at once trips
+    // Node's "MaxListenersExceededWarning" (possible EventEmitter leak).
+    try { await res.arrayBuffer(); } catch (_) { }
     if (!res.ok) throw new Error(`signal relay answered HTTP ${res.status}`);
   }
 

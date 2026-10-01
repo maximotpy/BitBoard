@@ -73,7 +73,9 @@ class BitBoardEngine(val context: Context) {
         val peers: Int,
         val progress: Float,
         val files: List<FileMeta>,
-        val syncing: Boolean = false
+        val syncing: Boolean = false,
+        /** Emoji chosen by the user for this board (empty = default glyph). */
+        val icon: String = ""
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -110,6 +112,12 @@ class BitBoardEngine(val context: Context) {
     private var discovery: LanDiscovery? = null
     private var peerId: String = ""
     @Volatile private var started = false
+
+    /** User settings + blacklists (images by hash, boards, peers). */
+    val settings = SettingsStore(context)
+
+    /** name -> emoji icon, persisted in state.json. */
+    private val boardIcons = ConcurrentHashMap<String, String>()
 
     /**
      * Single-threaded dispatcher that serializes ALL access to libtorrent
@@ -267,7 +275,17 @@ class BitBoardEngine(val context: Context) {
     private fun loadState(): Map<String, Long> {
         val out = LinkedHashMap<String, Long>()
         try {
-            val boardsObj = JSONObject(stateFile.readText()).optJSONObject("boards") ?: return out
+            val root = JSONObject(stateFile.readText())
+            // Board icons (optional; older state files don't have them).
+            val icons = root.optJSONObject("icons")
+            if (icons != null) {
+                val ik = icons.keys()
+                while (ik.hasNext()) {
+                    val k = ik.next()
+                    boardIcons[k] = icons.optString(k, "")
+                }
+            }
+            val boardsObj = root.optJSONObject("boards") ?: return out
             val keys = boardsObj.keys()
             while (keys.hasNext()) {
                 val key = keys.next()
@@ -290,7 +308,11 @@ class BitBoardEngine(val context: Context) {
                         .put("createdAt", b.createdAt)
                 )
             }
-            stateFile.writeText(JSONObject().put("boards", boardsObj).toString(2))
+            val iconsObj = JSONObject()
+            for ((k, v) in boardIcons) iconsObj.put(k, v)
+            stateFile.writeText(
+                JSONObject().put("boards", boardsObj).put("icons", iconsObj).toString(2)
+            )
         } catch (_: Exception) {}
     }
 
@@ -363,7 +385,46 @@ class BitBoardEngine(val context: Context) {
     }
 
     suspend fun joinBoard(name: String): BoardSnapshot = withContext(Dispatchers.IO) {
-        snapshot(ensureBoard(name, "joined"))
+        val n = name.trim()
+        if (settings.isBoardBlocked(n)) {
+            throw IllegalArgumentException("Board \"$n\" is blacklisted (unblock it in Settings)")
+        }
+        snapshot(ensureBoard(n, "joined"))
+    }
+
+    /**
+     * Leave a board: stop seeding/announcing it and forget it. The local
+     * folder is kept unless [deleteFiles] is set, so "leave + rejoin" keeps
+     * the images the device already had.
+     */
+    suspend fun leaveBoard(name: String, deleteFiles: Boolean = false): Boolean =
+        withContext(Dispatchers.IO) {
+            val board = boardMap.remove(name.trim()) ?: return@withContext false
+            stopSignal(board)
+            onLt {
+                val h = board.handle
+                board.handle = null
+                if (h != null) {
+                    try { session.remove(h) } catch (_: Throwable) {}
+                }
+            }
+            if (deleteFiles) {
+                try { board.dir.deleteRecursively() } catch (_: Exception) {}
+            }
+            saveState()
+            publishBoards()
+            discoveredMap.remove(board.name)
+            _discovered.value = discoveredMap.keys.toList()
+            log("left board \"${board.name}\"" + if (deleteFiles) " (files deleted)" else "")
+            true
+        }
+
+    /** Set (or clear with "") the emoji icon shown next to a board. */
+    suspend fun setBoardIcon(name: String, icon: String) = withContext(Dispatchers.IO) {
+        val n = name.trim()
+        if (icon.isBlank()) boardIcons.remove(n) else boardIcons[n] = icon.take(8)
+        saveState()
+        publishBoards()
     }
 
     /** Serialise (re)publishing per board. */
@@ -468,6 +529,13 @@ class BitBoardEngine(val context: Context) {
         val board = boardMap[boardName] ?: throw IllegalArgumentException("Unknown board: $boardName")
         val base = src.name
         require(Protocol.isImageFile(base)) { "Not an image file: $base" }
+        // Blacklist check by CONTENT hash: the same image is rejected under
+        // any file name.
+        val digest = try { Protocol.sha1Hex(src.readBytes()) } catch (_: Exception) { null }
+        if (digest != null && settings.isImageBlocked(digest)) {
+            log("blocked $base — image is blacklisted")
+            return@withContext false
+        }
         val dest = File(board.dir, base)
         src.copyTo(dest, overwrite = true)
         scanFiles(board)
@@ -477,6 +545,32 @@ class BitBoardEngine(val context: Context) {
         log("added $base to \"$boardName\" — replicating to peers")
         true
     }
+
+    /** SHA-1 of a board image's content (for the blacklist UI). */
+    fun imageHash(file: File): String? = try {
+        Protocol.sha1Hex(file.readBytes())
+    } catch (_: Exception) {
+        null
+    }
+
+    /** Delete a local image from a board and re-publish. */
+    suspend fun removeImage(boardName: String, fileName: String): Boolean =
+        withContext(Dispatchers.IO) {
+            val board = boardMap[boardName] ?: return@withContext false
+            val f = File(board.dir, fileName)
+            if (!f.isFile || f.canonicalFile != File(board.dir, f.name).canonicalFile) {
+                return@withContext false
+            }
+            val ok = f.delete()
+            if (ok) {
+                scanFiles(board)
+                publishLocked(board)
+                saveState()
+                publishBoards()
+                log("removed $fileName from \"$boardName\"")
+            }
+            ok
+        }
 
     private fun scanFiles(board: Board) {
         try {
@@ -506,10 +600,18 @@ class BitBoardEngine(val context: Context) {
 
     /** Boards announced by a LAN peer (beacon handler; runs on the UDP thread). */
     fun onLanBoards(peerBoards: List<Pair<String, String>>, addr: String, port: Int, fromPeerId: String) {
+        // Blacklisted peers are ignored entirely: their boards never show up
+        // as discovered and never merge.
+        if (settings.isPeerBlocked(fromPeerId)) return
         val now = System.currentTimeMillis()
         // Expire discovered boards whose beacons stopped arriving.
         discoveredMap.entries.removeIf { now - it.value > Protocol.DISCOVERED_TTL_MS }
         for ((name, hash) in peerBoards) {
+            // Blacklisted boards are hidden from discovery and never merged.
+            if (settings.isBoardBlocked(name)) {
+                discoveredMap.remove(name)
+                continue
+            }
             if (!boardMap.containsKey(name) && discoveredMap.put(name, now) == null) {
                 _discovered.value = discoveredMap.keys.toList()
             }
@@ -637,6 +739,7 @@ class BitBoardEngine(val context: Context) {
         if (msg.optString("app") != "bitboard") return
         val from = msg.optString("peerId")
         if (from.isEmpty() || from == peerId) return // ours, or malformed
+        if (settings.isPeerBlocked(from)) return     // blacklisted peer
         if (!Protocol.isInfoHash(msg.optString("infoHash"))) return
         log("relay: \"${board.name}\" peer ${from.take(4)} announced ${msg.optString("infoHash").take(8)}…")
         val prev = board.signalInbox[from]
@@ -849,7 +952,8 @@ class BitBoardEngine(val context: Context) {
             peers = maxOf(connected, lan),
             progress = if (syncing) b.mergeProgress else 1f,
             files = files,
-            syncing = syncing
+            syncing = syncing,
+            icon = boardIcons[b.name] ?: ""
         )
     }
 
@@ -870,12 +974,18 @@ class BitBoardEngine(val context: Context) {
             .sortedBy { it.createdAt }
             .map { it.name to it.infoHash }
 
-    /** Image files currently present in a board's folder (for the gallery). */
+    /** Image files currently present in a board's folder (for the gallery).
+     *  Blacklisted images (by content hash) are hidden. */
     fun boardFiles(name: String): List<File> {
         val b = boardMap[name] ?: return emptyList()
         scanFiles(b)
+        val blocked = settings.current().imageHashes
         return b.dir.listFiles()
             ?.filter { it.isFile && Protocol.isImageFile(it.name) }
+            ?.filter { f ->
+                if (blocked.isEmpty()) true
+                else try { !blocked.contains(Protocol.sha1Hex(f.readBytes())) } catch (_: Exception) { true }
+            }
             ?.sortedByDescending { it.lastModified() }
             ?: emptyList()
     }

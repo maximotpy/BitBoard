@@ -16,13 +16,23 @@ import com.bitboard.app.engine.BitBoardEngine.BoardSnapshot
  * file count / peers / progress, an "Add image" button, a "Join board" row,
  * and a "Discovered on network" section listing boards other devices
  * announced that this device has NOT joined (nothing is auto-joined).
+ *
+ * ALL rows (boards + join + discovered) are submitted to ListAdapter as ONE
+ * list so DiffUtil sees every change atomically. The previous design kept the
+ * discovered rows OUT of the submitted list and overrode getItemCount() —
+ * when the discovered section changed (a peer created a board, or a join
+ * removed a row) the item count changed without a matching notify, and
+ * DiffUtil's granular updates — computed in the boards-only coordinate
+ * space — landed on the wrong rows: RecyclerView "Inconsistency detected" /
+ * IndexOutOfBoundsException → app crash.
  */
 class BoardAdapter(
     private val onAddImage: (String) -> Unit,
     private val onJoin: () -> Unit,
     private val onJoinDiscovered: (String) -> Unit = {},
-    private val onOpenBoard: (String) -> Unit = {}
-) : ListAdapter<BoardSnapshot, RecyclerView.ViewHolder>(DIFF) {
+    private val onOpenBoard: (String) -> Unit = {},
+    private val onBoardMenu: (String) -> Unit = {}
+) : ListAdapter<BoardAdapter.Row, RecyclerView.ViewHolder>(DIFF) {
 
     companion object {
         private const val TYPE_BOARD = 0
@@ -32,32 +42,39 @@ class BoardAdapter(
         private const val TYPE_DISCOVERED = 4
     }
 
-    private var items: List<BoardSnapshot> = emptyList()
-    private var discovered: List<String> = emptyList()
-
-    fun submit(list: List<BoardSnapshot>) {
-        items = list
-        submitList(list)
+    /** One visual row. The whole screen is a single ListAdapter list. */
+    sealed class Row {
+        data class Board(val snapshot: BoardSnapshot) : Row()
+        object Join : Row()
+        object Empty : Row()
+        object DiscoveredHeader : Row()
+        data class Discovered(val name: String) : Row()
     }
 
-    fun submitDiscovered(names: List<String>) {
-        discovered = names.filter { n -> items.none { it.name == n } }
-        submitList(items)
+    /** Single entry point: boards + discovered names are combined into rows. */
+    fun submit(boards: List<BoardSnapshot>, discovered: List<String>) {
+        // A discovered name that we already joined must not render twice.
+        val pending = discovered.filter { n -> boards.none { it.name == n } }
+        val rows = ArrayList<Row>(boards.size + pending.size + 2)
+        if (boards.isEmpty() && pending.isEmpty()) {
+            rows.add(Row.Empty)
+        } else {
+            for (b in boards) rows.add(Row.Board(b))
+            rows.add(Row.Join)
+            if (pending.isNotEmpty()) {
+                rows.add(Row.DiscoveredHeader)
+                for (name in pending) rows.add(Row.Discovered(name))
+            }
+        }
+        submitList(rows)
     }
 
-    private fun discoveredCount(): Int = if (discovered.isEmpty()) 0 else discovered.size + 1
-
-    override fun getItemCount(): Int {
-        if (items.isEmpty()) return 1 + discoveredCount()
-        return items.size + 1 + discoveredCount()
-    }
-
-    override fun getItemViewType(position: Int): Int = when {
-        items.isEmpty() && position == 0 -> TYPE_EMPTY
-        position < items.size -> TYPE_BOARD
-        position == items.size -> TYPE_JOIN
-        position == items.size + 1 && discovered.isNotEmpty() -> TYPE_DISCOVERED_HEADER
-        else -> TYPE_DISCOVERED
+    override fun getItemViewType(position: Int): Int = when (getItem(position)) {
+        is Row.Board -> TYPE_BOARD
+        is Row.Join -> TYPE_JOIN
+        is Row.Empty -> TYPE_EMPTY
+        is Row.DiscoveredHeader -> TYPE_DISCOVERED_HEADER
+        is Row.Discovered -> TYPE_DISCOVERED
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
@@ -73,27 +90,44 @@ class BoardAdapter(
 
     override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
         when (holder) {
-            is BoardHolder -> holder.bind(items[position], onAddImage, onOpenBoard)
+            is BoardHolder -> holder.bind(
+                (getItem(position) as Row.Board).snapshot,
+                onAddImage, onOpenBoard, onBoardMenu
+            )
             is JoinHolder -> holder.bind(onJoin)
-            is DiscoveredHolder -> holder.bind(discovered[position - items.size - 2], onJoinDiscovered)
+            is DiscoveredHolder -> holder.bind((getItem(position) as Row.Discovered).name, onJoinDiscovered)
             else -> Unit
         }
     }
 
     class BoardHolder(v: View) : RecyclerView.ViewHolder(v) {
+        private val icon: TextView = v.findViewById(R.id.boardIcon)
         private val name: TextView = v.findViewById(R.id.boardName)
         private val meta: TextView = v.findViewById(R.id.boardMeta)
         private val progress: ProgressBar = v.findViewById(R.id.boardProgress)
         private val addBtn: Button = v.findViewById(R.id.btnAddImage)
 
-        fun bind(b: BoardSnapshot, onAddImage: (String) -> Unit, onOpenBoard: (String) -> Unit) {
+        fun bind(
+            b: BoardSnapshot,
+            onAddImage: (String) -> Unit,
+            onOpenBoard: (String) -> Unit,
+            onBoardMenu: (String) -> Unit
+        ) {
             name.text = b.name
+            if (b.icon.isNotBlank()) {
+                icon.text = b.icon
+                icon.visibility = View.VISIBLE
+            } else {
+                icon.visibility = View.GONE
+            }
             meta.text = "${b.fileCount} image(s) · ${b.peers} peer(s) · " +
                 "${formatBytes(b.totalBytes)} · ${(b.progress * 100).toInt()}%"
             progress.visibility = if (b.progress >= 1f) View.GONE else View.VISIBLE
             progress.progress = (b.progress * 100).toInt()
             addBtn.setOnClickListener { onAddImage(b.name) }
             itemView.setOnClickListener { onOpenBoard(b.name) }
+            // Long-press: leave / icon / blacklist (QoL menu).
+            itemView.setOnLongClickListener { onBoardMenu(b.name); true }
         }
 
         private fun formatBytes(n: Long): String = when {
@@ -123,8 +157,13 @@ class BoardAdapter(
 
     class EmptyHolder(v: View) : RecyclerView.ViewHolder(v)
 
-    private object DIFF : DiffUtil.ItemCallback<BoardSnapshot>() {
-        override fun areItemsTheSame(a: BoardSnapshot, b: BoardSnapshot) = a.name == b.name
-        override fun areContentsTheSame(a: BoardSnapshot, b: BoardSnapshot) = a == b
+    private object DIFF : DiffUtil.ItemCallback<Row>() {
+        override fun areItemsTheSame(a: Row, b: Row): Boolean = when {
+            a is Row.Board && b is Row.Board -> a.snapshot.name == b.snapshot.name
+            a is Row.Discovered && b is Row.Discovered -> a.name == b.name
+            else -> a::class == b::class
+        }
+
+        override fun areContentsTheSame(a: Row, b: Row): Boolean = a == b
     }
 }

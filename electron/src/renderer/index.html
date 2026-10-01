@@ -1,12 +1,14 @@
 <!DOCTYPE html>
 <html>
+
 <head>
   <meta charset="UTF-8">
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'">
+    content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'">
   <title>BitBoard</title>
   <link rel="stylesheet" href="style.css">
 </head>
+
 <body>
   <div id="app">
     <nav id="sidebar">
@@ -27,6 +29,10 @@
         <button id="btn-join-board" class="side-btn" title="Join board by name">
           <span class="btn-icon">&#8599;</span>
           <span class="btn-label">Join board</span>
+        </button>
+        <button id="btn-settings" class="side-btn" title="Settings">
+          <span class="btn-icon">&#9881;</span>
+          <span class="btn-label">Settings</span>
         </button>
       </div>
 
@@ -69,6 +75,49 @@
     </div>
   </div>
 
+  <div id="settings-backdrop" class="hidden">
+    <div id="settings-panel">
+      <div id="settings-title">Settings</div>
+
+      <div class="settings-section">Preferences</div>
+      <label class="settings-row">
+        <input type="checkbox" id="setting-show-log">
+        <span>Show activity log in the sidebar</span>
+      </label>
+      <label class="settings-row">
+        <input type="checkbox" id="setting-confirm-leave">
+        <span>Ask for confirmation before leaving a board</span>
+      </label>
+
+      <div class="settings-section">Blacklisted images (by content hash)</div>
+      <div id="blacklist-images" class="blacklist-list"></div>
+
+      <div class="settings-section">Blacklisted boards</div>
+      <div id="blacklist-boards" class="blacklist-list"></div>
+
+      <div class="settings-section">Blacklisted peers</div>
+      <div id="blacklist-peers" class="blacklist-list"></div>
+
+      <div id="settings-peerid" class="settings-peerid"></div>
+
+      <div id="settings-buttons">
+        <button id="settings-close" class="flat-btn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="icon-picker-backdrop" class="hidden">
+    <div id="icon-picker">
+      <div id="icon-picker-title">Pick a board icon</div>
+      <div id="icon-grid"></div>
+      <div id="icon-picker-buttons">
+        <button id="icon-clear" class="flat-btn">Clear</button>
+        <button id="icon-cancel" class="flat-btn">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <script src="renderer.js"></script>
 </body>
+
 </html>
