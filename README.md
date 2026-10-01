@@ -1,7 +1,6 @@
 # BitBoard
 
-P2P image replication between devices — a monorepo containing two clients
-that share the same protocol and sync model:
+P2P image replication between devices
 
 | Folder   | Client            | Stack                          |
 |----------|-------------------|--------------------------------|
@@ -10,8 +9,7 @@ that share the same protocol and sync model:
 
 Every **board** is a named folder of images. Each device running BitBoard that
 joins a board both **seeds and downloads** it over the **BitTorrent protocol**,
-so images replicate automatically to every device that has the same board —
-like a cloud folder, but fully peer-to-peer.
+so images replicate automatically to every device that has the same board
 
 ## How it works
 
