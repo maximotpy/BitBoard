@@ -8,16 +8,20 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "test:signal": "node test/signal-test.js"
+    "test:signal": "node test/signal-test.js",
+    "package": "node scripts/package.js",
+    "package:win": "node scripts/package.js --win32 --x64"
   },
   "devDependencies": {
-    "electron": "^31.7.7"
+    "@electron/packager": "^20.3.0",
+    "electron": "^31.7.7",
+    "electron-packager": "^17.1.2"
   },
   "dependencies": {
     "create-torrent": "^6.0.15",
     "parse-torrent": "^11.0.17",
-    "webtorrent": "^2.2.1",
-    "uint8-util": "2.2.6"
+    "uint8-util": "2.2.6",
+    "webtorrent": "^2.2.1"
   },
   "allowScripts": {
     "electron@31.7.7": true,

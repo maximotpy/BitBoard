@@ -1,4 +1,4 @@
-/* BitBoard — flat, sharp-cornered, no gradients. Helvetica Neue only. */
+/* BitBoard, flat, sharp-cornered, no gradients. Helvetica Neue only. */
 
 * {
   margin: 0;
@@ -497,7 +497,7 @@ body {
   z-index: 100;
 }
 
-/* Must outrank the ID rule above — class-only .hidden loses on specificity. */
+/* Must outrank the ID rule above, class-only .hidden loses on specificity. */
 #modal-backdrop.hidden {
   display: none;
 }

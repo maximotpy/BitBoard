@@ -21,7 +21,7 @@ import java.net.NetworkInterface
 import java.net.SocketTimeoutException
 
 /**
- * LAN discovery — UDP beacon compatible with the desktop engine.
+ * LAN discovery, UDP beacon compatible with the desktop engine.
  *
  * Wire format:
  *   {"app":"bitboard","v":2,"peerId":"…","host":"…","port":6881,"reply":false,

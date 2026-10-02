@@ -21,13 +21,29 @@ android {
 
     splits {
         abi {
-            isEnable = false
+            isEnable = true
+            reset()
+            include("x86", "x86_64", "arm64-v8a", "armeabi-v7a")
+            isUniversalApk = true
+        }
+    }
+
+    signingConfigs {
+        create("release") {
+            storeFile = file("keystore.jks")
+            storePassword = "bitboardpass"
+            keyAlias = "bitboard"
+            keyPassword = "bitboardpass"
         }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("release")
+        }
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

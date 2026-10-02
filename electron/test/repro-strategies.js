@@ -24,7 +24,7 @@ async function main() {
   client.on('warning', (err) => console.log('client warning:', err.message));
   await new Promise(r => setTimeout(r, 300));
 
-  // Strategy A: client.seed(dir) — what the engine does today
+  // Strategy A: client.seed(dir), what the engine does today
   console.log('--- A: client.seed(dir) ---');
   await new Promise((resolve) => {
     client.seed(dir, { announce: [] }, (t) => {

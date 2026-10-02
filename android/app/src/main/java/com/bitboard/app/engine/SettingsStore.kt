@@ -11,7 +11,7 @@ import java.io.File
  * mirrored to a JSON file so the desktop app's data dir stays portable.
  *
  * Blacklists:
- *  - imageHashes: SHA-1 of image CONTENT — an image is blocked on every
+ *  - imageHashes: SHA-1 of image CONTENT, an image is blocked on every
  *    device that has the same bytes, regardless of its file name.
  *  - boards: board names that must never be joined and are hidden from the
  *    "discovered on network" list.

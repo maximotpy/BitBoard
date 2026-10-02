@@ -19,11 +19,11 @@ import com.bitboard.app.engine.BitBoardEngine.BoardSnapshot
  *
  * ALL rows (boards + join + discovered) are submitted to ListAdapter as ONE
  * list so DiffUtil sees every change atomically. The previous design kept the
- * discovered rows OUT of the submitted list and overrode getItemCount() —
+ * discovered rows OUT of the submitted list and overrode getItemCount() ,
  * when the discovered section changed (a peer created a board, or a join
  * removed a row) the item count changed without a matching notify, and
- * DiffUtil's granular updates — computed in the boards-only coordinate
- * space — landed on the wrong rows: RecyclerView "Inconsistency detected" /
+ * DiffUtil's granular updates, computed in the boards-only coordinate
+ * space, landed on the wrong rows: RecyclerView "Inconsistency detected" /
  * IndexOutOfBoundsException → app crash.
  */
 class BoardAdapter(

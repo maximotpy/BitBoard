@@ -1,6 +1,6 @@
 # BitBoard for Android
 
-Native Android port of BitBoard — P2P image replication between devices over
+Native Android port of BitBoard, P2P image replication between devices over
 the BitTorrent protocol. **Interoperates with the desktop (Electron) app**:
 boards created on either platform sync to the other automatically.
 
@@ -73,4 +73,4 @@ backgrounded.
 
 - WebTorrent's WebRTC trackers are not used on Android (libtorrent speaks
   BitTorrent over TCP/UDP); sync works via DHT, UDP trackers, LSD and the LAN
-  beacon — which covers LAN and most internet scenarios.
+  beacon, which covers LAN and most internet scenarios.

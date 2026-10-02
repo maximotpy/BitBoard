@@ -21,7 +21,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
- * Board detail screen — the Android counterpart of the desktop "Gallery" tab.
+ * Board detail screen, the Android counterpart of the desktop "Gallery" tab.
  * Shows the board's images in a grid; tapping an image opens it full-screen.
  */
 class BoardActivity : AppCompatActivity() {
@@ -35,7 +35,7 @@ class BoardActivity : AppCompatActivity() {
 
     /** Emoji palette for the board-icon picker. */
     private val iconPalette = listOf(
-        "📌", "🎨", "📷", "🐱", "🐶", "🍕", "🚗", "✈️", "🏖", "⛰", "🎮", "🎵",
+        "📌", "🎨", "📷", "🐱", "🐶", "🍕", "�,", "✈️", "🏖", "⛰", "🎮", "🎵",
         "💻", "📚", "💼", "🔥", "⭐", "🌙", "☀️", "🌈", "🍀", "🌊", "🎂", "🎁"
     )
 
@@ -139,7 +139,7 @@ class BoardActivity : AppCompatActivity() {
         val palette = (iconPalette + (if (current.isNotBlank()) listOf(current) else emptyList()))
             .distinct().toTypedArray()
         AlertDialog.Builder(this)
-            .setTitle(getString(R.string.icon_pick_title) + " — " + boardName)
+            .setTitle(getString(R.string.icon_pick_title) + ", " + boardName)
             .setItems(palette) { _, which ->
                 lifecycleScope.launch {
                     App.engine(applicationContext).setBoardIcon(boardName, palette[which])

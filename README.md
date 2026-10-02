@@ -16,8 +16,8 @@ so images replicate automatically to every device that has the same board
 ```
 Device A                 Device B
 ┌──────────┐   BitTorrent swarm (DHT + trackers)   ┌──────────┐
-│ board:   │ ◄──────────── images ────────────►    │ board:   │
-│ Vacation │ ◄──────────── images ────────────►    │ Vacation │
+│ board:   │ �,�──────────── images ────────────►    │ board:   │
+│ Vacation │ �,�──────────── images ────────────►    │ Vacation │
 └──────────┘                                       └──────────┘
      └──────────── LAN UDP multicast beacon ────────────┘
         (auto-discovers boards on the same network)
@@ -75,6 +75,6 @@ See `android/README.md` for details.
 
 ## Data location (desktop)
 
-`data/boards/<hash>/` — board folders (images live here, safe to back up).
-`data/torrents/` — generated `.torrent` files.
-`data/state.json` — board registry.
+`data/boards/<hash>/`, board folders (images live here, safe to back up).
+`data/torrents/`, generated `.torrent` files.
+`data/state.json`, board registry.

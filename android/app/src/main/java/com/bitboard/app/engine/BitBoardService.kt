@@ -14,7 +14,7 @@ import com.bitboard.app.App
 /**
  * Foreground service that keeps the BitBoard engine (torrent session + LAN
  * beacon) alive while the app is backgrounded, so seeding and replication
- * continue — the whole point of the app.
+ * continue, the whole point of the app.
  */
 class BitBoardService : Service() {
 

@@ -19,7 +19,7 @@ import java.net.URLEncoder
  * This channel lets devices tell each other "for board X my current torrent is
  * <infohash>" through a tiny pub/sub relay (ntfy protocol, https://ntfy.sh by
  * default). One topic per board, derived from a hash of the board name. Only
- * infohashes are sent — never images, IPs or file names. Once a peer's infohash
+ * infohashes are sent, never images, IPs or file names. Once a peer's infohash
  * is known, libtorrent finds the peer through trackers / DHT / PEX as usual.
  */
 class SignalChannel(
@@ -104,7 +104,7 @@ class SignalChannel(
                     }
                 } catch (e: Exception) {
                     if (sub.closed) break
-                    log("signal relay: ${e.message} — retrying")
+                    log("signal relay: ${e.message}, retrying")
                 } finally {
                     try { conn?.disconnect() } catch (_: Exception) {}
                 }

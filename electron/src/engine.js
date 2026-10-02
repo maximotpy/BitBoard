@@ -6,7 +6,7 @@
  * Every "board" is a folder of images that is published as a BitTorrent
  * (v1/v2 hybrid, via WebTorrent). Every device that joins the same board
  * seeds and leeches simultaneously, so files replicate automatically
- * between devices — like a cloud folder, but fully peer-to-peer.
+ * between devices, like a cloud folder, but fully peer-to-peer.
  *
  * Discovery:
  *  - DHT + WebTorrent trackers (public swarm, works across the internet)
@@ -122,7 +122,7 @@ function sha1Buf(buf) {
 /**
  * User settings + blacklists, persisted in <dataDir>/settings.json.
  * Blacklists:
- *  - imageHashes: SHA-1 of image CONTENT — an image is blocked on every
+ *  - imageHashes: SHA-1 of image CONTENT, an image is blocked on every
  *    device that has the same bytes, regardless of its file name.
  *  - boards: board names that must never be joined and are hidden from the
  *    "discovered on network" list.
@@ -339,7 +339,7 @@ class BitBoardEngine extends EventEmitter {
       this._emitBoardsChanged();
       try {
         await this._publishLocked(board);
-        this.emit('log', `restored board "${name}" — seeding`);
+        this.emit('log', `restored board "${name}", seeding`);
       } catch (err) {
         // Keep the board listed; the next image / beacon retries.
         this.emit('log', `could not fully restore "${name}": ${err.message}`);
@@ -385,7 +385,7 @@ class BitBoardEngine extends EventEmitter {
       }
       this._saveState();
       this._emitBoardsChanged();
-      this._discovered.delete(name);   // no longer just "discovered" — we have it
+      this._discovered.delete(name);   // no longer just "discovered", we have it
       this._emitDiscoveredChanged();
       this.emit('log', `board "${name}" ${verb} (${board.infoHash.slice(0, 12)}…)`);
       return board;
@@ -560,7 +560,7 @@ class BitBoardEngine extends EventEmitter {
     let digest = null;
     try { digest = sha1Buf(fs.readFileSync(srcPath)); } catch (_) { }
     if (digest && this.settings.isImageBlocked(digest)) {
-      this.emit('log', `blocked ${base} — image is blacklisted`);
+      this.emit('log', `blocked ${base}, image is blacklisted`);
       return false;
     }
     const dest = path.join(board.dir, base);
@@ -570,7 +570,7 @@ class BitBoardEngine extends EventEmitter {
     await this._publishLocked(board);
     this._saveState();
     this._emitBoardsChanged();
-    this.emit('log', `added ${base} to "${boardName}" — replicating to peers`);
+    this.emit('log', `added ${base} to "${boardName}", replicating to peers`);
     return true;
   }
 
@@ -613,7 +613,7 @@ class BitBoardEngine extends EventEmitter {
       // Blacklisted boards are hidden from discovery and never merged.
       if (this.settings.isBoardBlocked(name)) return;
       // Board we don't have: remember it so the UI can offer it, but NEVER
-      // auto-join — a board only lands on this device when the user asks for
+      // auto-join, a board only lands on this device when the user asks for
       // it (otherwise every board on the LAN would appear here on first run).
       const isNew = !this._discovered.has(name);
       this._discovered.set(name, Date.now());
@@ -1054,7 +1054,7 @@ class BitBoardEngine extends EventEmitter {
         fileCount: files.length,
         totalBytes: files.reduce((s, f) => s + f.size, 0),
         // Peers we are connected to, or LAN devices that announced this board
-        // in the last few seconds — whichever is larger.
+        // in the last few seconds, whichever is larger.
         peers: Math.max(b.torrent ? b.torrent.numPeers : 0, lan),
         progress: 1,
         syncing: b.merging.size > 0,

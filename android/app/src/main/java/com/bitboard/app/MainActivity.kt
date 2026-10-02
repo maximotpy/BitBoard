@@ -32,7 +32,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Emoji palette for the board-icon picker. */
     private val iconPalette = listOf(
-        "📌", "🎨", "📷", "🐱", "🐶", "🍕", "🚗", "✈️", "🏖", "⛰", "🎮", "🎵",
+        "📌", "🎨", "📷", "🐱", "🐶", "🍕", "�,", "✈️", "🏖", "⛰", "🎮", "🎵",
         "💻", "📚", "💼", "🔥", "⭐", "🌙", "☀️", "🌈", "🍀", "🌊", "🎂", "🎁"
     )
 
@@ -152,7 +152,7 @@ class MainActivity : AppCompatActivity() {
         val palette = (iconPalette + (if (current.isNotBlank()) listOf(current) else emptyList()))
             .distinct().toTypedArray()
         AlertDialog.Builder(this)
-            .setTitle(getString(R.string.icon_pick_title) + " — " + name)
+            .setTitle(getString(R.string.icon_pick_title) + ", " + name)
             .setItems(palette) { _, which ->
                 lifecycleScope.launch {
                     App.engine(applicationContext).setBoardIcon(name, palette[which])

@@ -30,7 +30,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   // Create the window FIRST so the app is visibly alive even if engine
-  // startup is slow or fails — a rejected promise here used to leave the
+  // startup is slow or fails, a rejected promise here used to leave the
   // process running with no window at all (looked like "app won't start").
   createWindow();
 

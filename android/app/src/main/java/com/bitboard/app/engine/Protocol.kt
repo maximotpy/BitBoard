@@ -9,7 +9,7 @@ import java.security.MessageDigest
  *
  * Wire protocol:
  *  - Board folder name: sha1(name.trim().toLowerCase()) hex, first 16 chars.
- *  - Manifest: "bitboard-manifest.json" (visible, NOT dot-prefixed —
+ *  - Manifest: "bitboard-manifest.json" (visible, NOT dot-prefixed ,
  *    create-torrent silently drops hidden files) with shape
  *    { board, createdAt, files: [{name, size, mtime}] }.
  *  - Torrent name: the board folder's basename (libtorrent/WebTorrent both

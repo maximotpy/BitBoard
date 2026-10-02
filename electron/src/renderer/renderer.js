@@ -1,6 +1,6 @@
 'use strict';
 
-/* BitBoard renderer — talks to the P2P engine through the preload bridge. */
+/* BitBoard renderer, talks to the P2P engine through the preload bridge. */
 
 const els = {
   boardList: document.getElementById('board-list'),
@@ -79,7 +79,7 @@ function renderBoardList() {
   }
 
   // Boards other devices announced on the LAN that we have NOT joined.
-  // They are offered here — nothing is ever auto-joined.
+  // They are offered here, nothing is ever auto-joined.
   const offerable = discovered.filter(n => !boards.some(b => b.name === n));
   if (offerable.length) {
     const head = document.createElement('div');
@@ -427,7 +427,7 @@ function confirmLeaveBoard(name) {
 
 function blacklistBoard(name) {
   window.bitboard.addBoardBlacklist(name);
-  logLine('Board "' + name + '" blacklisted — unblock it in Settings.');
+  logLine('Board "' + name + '" blacklisted, unblock it in Settings.');
 }
 
 /* ---------------- board icon picker ---------------- */
@@ -466,7 +466,7 @@ async function blacklistImage(boardName, fileName) {
   const hash = await window.bitboard.imageHash(boardName, fileName);
   if (!hash) { logLine('Could not hash "' + fileName + '"'); return; }
   await window.bitboard.addImageHash(hash);
-  logLine('Image blacklisted by hash ' + hash.slice(0, 12) + '… — it is now hidden and never synced.');
+  logLine('Image blacklisted by hash ' + hash.slice(0, 12) + '…, it is now hidden and never synced.');
 }
 
 function deleteImage(boardName, fileName) {

@@ -18,6 +18,8 @@ android/build/
 # Precompiled artifacts (APK / AAB bundles)
 *.apk
 *.aab
+*.jks
+*.keystore
 
 # Android Studio / IntelliJ project files
 .idea/
